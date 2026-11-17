@@ -116,7 +116,7 @@ function setSource(w, h){
   const s = Math.min(1, 1280 / w);
   view.width = Math.round(w * s); view.height = Math.round(h * s);
   LH = Math.round(LW * h / w); lc.width = LW; lc.height = LH; G = new Float32Array(LW * LH);
-  rowStart = new Int32Array(LH); rowEnd = new Int32Array(LH); rowMot = new Float32Array(LH); prevG = null;
+  rowStart = new Int32Array(LH); rowEnd = new Int32Array(LH); prevG = null; edgeP = null; hoodCol = null;
   SH = Math.round(SW * h / w); sc.width = SW; sc.height = SH;
   redM = new Uint8Array(SW * SH); whM = new Uint8Array(SW * SH); yeM = new Uint8Array(SW * SH); darkM = new Uint8Array(SW * SH);
   tmpM = new Uint8Array(SW * SH); labA = new Int32Array(SW * SH);
@@ -190,7 +190,7 @@ const LW = 400; let LH = 225;
 const cal = { vpx: LW / 2, vpy: 112, camH: 1.3, conf: 0, n: 0, hN: 0, hoodY: null };
 function resetCalibration(){
   cal.vpx = LW / 2; cal.vpy = LH * P.hor; cal.camH = P.camH; cal.conf = 0; cal.n = 0; cal.hN = 0; cal.hoodY = null;
-  if (rowMot) rowMot.fill(0); prevG = null;
+  prevG = null; edgeP = null; hoodCol = null; cal.moving = 0;
 }
 // FOV setting = horizontal FOV of the camera held in landscape. In portrait the image is the narrow side.
 function fovEff(){
@@ -202,7 +202,7 @@ function groundToImage(X, Z){ const f = fpx(); return [cal.vpx + f * X / Z, cal.
 function imageToGround(x, y){ const dy = y - cal.vpy; if (dy < 0.5) return null; const Z = fpx() * cal.camH / dy; return { Z, X: (x - cal.vpx) * cal.camH / dy }; }
 function bottomY(){
   const manual = Math.min(LH - 2, Math.round(LH * P.bot) - 1);
-  if (P.auto && cal.hoodY !== null) return Math.max(Math.round(cal.vpy + (LH - cal.vpy) * 0.3), Math.min(manual, Math.round(cal.hoodY) - 2));
+  if (P.auto && cal.hoodY !== null) return Math.max(Math.round(cal.vpy + (LH - cal.vpy) * 0.3), Math.min(LH - 2, Math.round(cal.hoodY) - 2));
   return manual;
 }
 
@@ -211,7 +211,7 @@ function bottomY(){
 // → curved tracking far up the road → ground-plane curve fit → all lanes
 // ===================================================================
 const lc = document.createElement('canvas'); const lctx = lc.getContext('2d', { willReadFrequently: true });
-let G = null, prevG = null, rowMot = null, feats = [], rowStart = null, rowEnd = null;
+let G = null, prevG = null, feats = [], rowStart = null, rowEnd = null;
 const PHIS = []; for (let a = 6; a <= 80; a += 2) PHIS.push(Math.tan(a * Math.PI / 180));
 const BIN = 3, XMIN = -LW * 0.8, NB = Math.ceil(LW * 2.6 / BIN);
 const accL = new Float32Array(PHIS.length * NB), accR = new Float32Array(PHIS.length * NB);
@@ -251,7 +251,7 @@ function detectLanes(src){
     for (let x = k; x < LW - k; x++) {
       const c = G[row + x], l = G[row + x - k], r = G[row + x + k];
       const v = 2 * c - l - r - Math.abs(l - r);
-      if (v > thrY && c > rowMean + 8 && c > 70) feats.push(x, y, Math.min(v, 200));
+      if (v > thrY && c > rowMean + 8 && c > 70 && !belowHood(x, y)) feats.push(x, y, Math.min(v, 200));
     }
     rowEnd[y] = feats.length;
   }
@@ -302,8 +302,32 @@ function detectLanes(src){
     const sL = lane.L.pts.length, sR = lane.R.pts.length;
     if (sL < sR) lane.L.curve = null; else lane.R.curve = null;
   }
+  // lane edges stay parallel. If one edge peels away (exit ramp, merge), cut it where it splits
+  // and let the straighter edge define the road shape.
+  lane.split = null;
+  const cL = lane.L.curve, cR = lane.R.curve;
+  if (cL && cR) {
+    const w0 = cR.a - cL.a, zEnd = Math.min(cL.zMax, cR.zMax);
+    const wAt = Z => (cR.a + cR.b * Z + cR.c * Z * Z) - (cL.a + cL.b * Z + cL.c * Z * Z);
+    let zSplit = null;
+    for (let Z = 5; Z <= zEnd; Z += 2) if (Math.abs(wAt(Z) - w0) > Math.max(0.6, w0 * 0.18)) { zSplit = Z; break; }
+    // shapes that disagree (one edge S-bends into a ramp while the other runs straight) also mean a split
+    const shapeDiff = Math.abs(cL.c - cR.c) > 0.0018 || Math.abs(cL.b - cR.b) > 0.08;
+    if (zSplit !== null || shapeDiff) {
+      const off = Math.abs(cL.c) * 1e3 + Math.abs(cL.b) * 10 > Math.abs(cR.c) * 1e3 + Math.abs(cR.b) * 10 ? 'L' : 'R';
+      const bad = off === 'L' ? cL : cR, good = off === 'L' ? cR : cL;
+      if (zSplit === null) {   // where the bad edge leaves a path parallel to the good one
+        zSplit = bad.zMax;
+        for (let Z = 4; Z <= bad.zMax; Z += 1) { const d = (bad.b - good.b) * Z + (bad.c - good.c) * Z * Z; if (Math.abs(d) > 0.4) { zSplit = Z; break; } }
+      }
+      lane.split = { side: off, z: zSplit };
+      bad.zMax = Math.max(lane.zNear + 1, Math.min(bad.zMax, zSplit));
+      // continue the cut edge parallel to the good one for drawing/lane width
+      bad.ghost = { a: bad.a, b: good.b, c: good.c };
+    }
+  }
   // shared road shape (both edges of a lane bend together)
-  const cs = [lane.L.curve, lane.R.curve].filter(Boolean);
+  const cs = [lane.L.curve, lane.R.curve].filter(Boolean).map(c => c.ghost ? { ...c, b: c.ghost.b, c: c.ghost.c } : c);
   if (cs.length) {
     const wsum = cs.reduce((s, c) => s + c.zMax, 0);
     lane.b = cs.reduce((s, c) => s + c.b * c.zMax, 0) / wsum; lane.c = cs.reduce((s, c) => s + c.c * c.zMax, 0) / wsum;
@@ -313,29 +337,59 @@ function detectLanes(src){
   multiLane();
   frameCount++;
 }
-// rows that never change while driving are the hood / dashboard
+// The hood/dashboard outline is an edge that stays at the same place in the frame while the road
+// streams past. (Brightness on a wet hood changes with reflections, so we track the edge, not the pixels.)
+const HC = 4;                       // column step for the hood contour
+let edgeP = null, hoodCol = null;   // persistence of horizontal edges; hood top per column (lane-buffer rows)
 function autoHood(y0){
+  const r0 = Math.max(y0 + 2, Math.round(cal.vpy + (LH - cal.vpy) * 0.25));
+  if (!edgeP || edgeP.length !== LW * LH) { edgeP = new Float32Array(LW * LH); hoodCol = new Float32Array(Math.ceil(LW / HC)).fill(LH); }
+  // road motion: is the car moving? (needed so parked scenes don't look "static")
+  let mot = 0, mn = 0;
   if (prevG) {
-    for (let y = y0; y < LH; y++) {
-      let s = 0; const row = y * LW;
-      for (let x = 2; x < LW; x += 5) s += Math.abs(G[row + x] - prevG[row + x]);
-      rowMot[y] = rowMot[y] * 0.92 + (s / (LW / 5)) * 0.08;
-    }
+    const a = r0, b = Math.round(cal.vpy + (LH - cal.vpy) * 0.6);
+    for (let y = a; y < b; y += 2) { const row = y * LW; for (let x = 3; x < LW; x += 7) { mot += Math.abs(G[row + x] - prevG[row + x]); mn++; } }
+    mot = mn ? mot / mn : 0;
   }
   if (!prevG) prevG = new Float32Array(LW * LH);
   prevG.set(G.subarray(y0 * LW), y0 * LW);
-  if (frameCount % 10 || !P.auto) return;
-  const a = Math.round(cal.vpy + (LH - cal.vpy) * 0.25), b = Math.round(cal.vpy + (LH - cal.vpy) * 0.6);
-  if (b - a < 5) return;
-  const ref = Array.from(rowMot.subarray(a, b)).sort((p, q) => p - q)[((b - a) / 2) | 0];
-  if (ref < 2) return;                                   // car not moving: keep the previous estimate
-  let hood = LH;
-  for (let y = LH - 1; y > b; y--) {
-    let ok = true; for (let k = 0; k < 4; k++) if (rowMot[y - k] < ref * 0.4) { ok = false; break; }
-    if (ok) { hood = y + 1; break; }
+  cal.moving = (cal.moving || 0) * 0.9 + (mot > 2.5 ? 1 : 0) * 0.1;
+  if (!P.auto || cal.moving < 0.5) return;
+  for (let y = r0; y < LH - 1; y++) {
+    const row = y * LW;
+    for (let x = 0; x < LW; x += 2) {
+      const e = Math.abs(G[row + LW + x] - G[row - LW + x]) > 14 ? 1 : 0;
+      edgeP[row + x] = edgeP[row + x] * 0.97 + e * 0.03;
+    }
   }
-  cal.hoodY = cal.hoodY === null ? hood : cal.hoodY + (hood - cal.hoodY) * 0.3;
+  if (frameCount % 8) return;
+  // per column: the TOPMOST persistent edge in the lower part = hood outline
+  const nC = hoodCol.length, cand = new Float32Array(nC);
+  for (let c = 0; c < nC; c++) {
+    const x = Math.min(LW - 2, c * HC) & ~1;
+    let found = LH;
+    for (let y = r0; y < LH - 1; y++) {
+      // a persistent edge, with persistent edges also in the neighbouring columns (a long contour, not a lane-line pixel)
+      if (edgeP[y * LW + x] > 0.6) {
+        let nb = 0;
+        for (let dx = -8; dx <= 8; dx += 2) { const xx = x + dx; if (xx < 0 || xx >= LW) continue; for (let dy = -2; dy <= 2; dy++) if (edgeP[(y + dy) * LW + xx] > 0.5) { nb++; break; } }
+        if (nb >= 7) { found = y; break; }
+      }
+    }
+    cand[c] = found;
+  }
+  // smooth: median of 5 neighbours, then never let the contour rise above the road band
+  for (let c = 0; c < nC; c++) {
+    const w = []; for (let k = -2; k <= 2; k++) w.push(cand[Math.max(0, Math.min(nC - 1, c + k))]);
+    w.sort((a, b) => a - b);
+    hoodCol[c] = hoodCol[c] === LH && w[2] < LH ? w[2] : hoodCol[c] + (w[2] - hoodCol[c]) * 0.35;
+  }
+  // a single row for the ROI: the hood top over the central 60% (its highest point)
+  const mid = Array.from(hoodCol.subarray(Math.round(nC * 0.2), Math.round(nC * 0.8))).sort((a, b) => a - b);
+  const h = mid[Math.floor(mid.length * 0.2)];
+  if (h < LH) cal.hoodY = cal.hoodY === null ? h : cal.hoodY + (h - cal.hoodY) * 0.4;
 }
+const belowHood = (x, y) => hoodCol && P.auto && cal.hoodY !== null && y > hoodCol[Math.max(0, Math.min(hoodCol.length - 1, Math.round(x / HC)))] - 3;
 function track(s, det){
   const close = (a, b) => Math.abs(a.xb - b.xb) < LW * 0.1 && Math.abs(Math.atan(a.t) - Math.atan(b.t)) < 0.18;
   if (det) {
@@ -411,6 +465,7 @@ function calibrate(yB){
 }
 // follow one line from the bottom up to the horizon, tolerant of dash gaps and curves
 function traceCurve(s, yB){
+  if (s.curve) delete s.curve.ghost;
   if (!s.line) { s.pts = []; return; }
   const pts = [];
   let x = s.line.xb, slope = s.line.t;              // slope = dx per row going UP
@@ -443,7 +498,7 @@ function traceCurve(s, yB){
     T[0] += w * g.X; T[1] += w * g.X * z; T[2] += w * g.X * z * z;
   }
   let a, b, c = 0;
-  const lam = 2e4 * S[0] / Math.max(1, zMax * zMax);      // keeps curvature modest unless well supported
+  const lam = 6e4 * S[0] / Math.max(1, zMax * zMax);      // keeps curvature modest unless well supported
   if (zMax > 18 && pts.length > 15) {
     const M = [[S[0], S[1], S[2]], [S[1], S[2], S[3]], [S[2], S[3], S[4] + lam]];
     const sol = solve3(M, T); if (!sol) return; [a, b, c] = sol;
@@ -452,7 +507,7 @@ function traceCurve(s, yB){
     a = (T[0] * S[2] - S[1] * T[1]) / det; b = (S[0] * T[1] - S[1] * T[0]) / det;
   }
   c = Math.max(-0.006, Math.min(0.006, c)); b = Math.max(-0.6, Math.min(0.6, b));
-  const prev = s.curve, k = prev ? 0.35 : 1;
+  const prev = s.curve, k = prev ? 0.2 : 1;               // real roads change shape slowly
   s.curve = prev ? { a: prev.a + (a - prev.a) * k, b: prev.b + (b - prev.b) * k, c: prev.c + (c - prev.c) * k, zMax: prev.zMax + (Math.min(100, zMax) - prev.zMax) * 0.3 }
                  : { a, b, c, zMax: Math.min(100, zMax) };
 }
@@ -538,7 +593,7 @@ function laneLogic(){
     else if (side === 'L') alertUser('lane-left', '⚠️ Chap chiziqqa yaqinlashdingiz', 'bad', 3500, 'Chap chiziq');
     else alertUser('lane-right', "⚠️ O'ng chiziqqa yaqinlashdingiz", 'bad', 3500, "O'ng chiziq");
   }
-  const curv = Math.abs(lane.c) > 0.0006 ? (lane.c > 0 ? ' · ↪' : ' · ↩') : '';
+  const curv = (Math.abs(lane.c) > 0.0006 ? (lane.c > 0 ? ' · ↪' : ' · ↩') : '') + (lane.split ? (lane.split.side === 'R' ? " · o'ngda chiqish" : ' · chapda ajralish') : '');
   $('sOff').textContent = off === null ? '—' : (Math.abs(off) > P.dep ? (off < 0 ? '← chapda' : "o'ngda →") : 'markazda ✓') + curv;
   $('sLanes').textContent = lane.nLanes ? `${lane.nLanes} ta · siz ${lane.egoIdx}-da` : (L || R ? 'aniqlanmoqda…' : '—');
   $('sCal').textContent = P.auto ? (cal.conf >= 1 ? `✓ h=${cal.camH.toFixed(2)} m` : `${Math.round(cal.conf * 100)}%`) : "qo'lda";
@@ -1087,8 +1142,8 @@ function render(src){
   };
   const sideCurve = s => {
     if (s.curve) {
-      const c = s.curve, out = [];
-      for (let Z = zNear; Z <= c.zMax; Z *= 1.06) { const [x, y] = groundToImage(c.a + c.b * Z + c.c * Z * Z, Z); out.push([x * kx, Math.min(yB, y) * ky]); }
+      const c = s.curve, g = c.ghost || c, out = [];
+      for (let Z = zNear; Z <= c.zMax; Z *= 1.06) { const [x, y] = groundToImage(c.a + g.b * Z + g.c * Z * Z, Z); out.push([x * kx, Math.min(yB, y) * ky]); }
       return out;
     }
     if (s.line) { const ln = s.line, yTop = yT + (yB - yT) * 0.5; return [[(ln.xb) * kx, yB * ky], [(ln.xb + ln.t * (yB - yTop)) * kx, yTop * ky]]; }
@@ -1118,7 +1173,10 @@ function render(src){
   }
   ctx.lineWidth = Math.max(4, W / 170); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
   for (const pts of [cl, cr]) if (pts && pts.length > 1) { ctx.strokeStyle = warn ? '#ff4d4d' : '#3ddc97'; stroke(pts); }
-  if (P.dbg && cal.hoodY !== null) { ctx.strokeStyle = 'rgba(255,120,0,.9)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, yB * ky); ctx.lineTo(W, yB * ky); ctx.stroke(); }
+  if (P.dbg && cal.hoodY !== null) {
+    ctx.strokeStyle = 'rgba(255,120,0,.9)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, yB * ky); ctx.lineTo(W, yB * ky); ctx.stroke();
+    if (hoodCol) { ctx.strokeStyle = 'rgba(255,0,200,.9)'; ctx.beginPath(); for (let c = 0; c < hoodCol.length; c++) ctx[c ? 'lineTo' : 'moveTo'](c * HC * kx, Math.min(LH, hoodCol[c]) * ky); ctx.stroke(); }
+  }
   // vehicles
   const sx = W / srcW, sy = H / srcH;
   ctx.font = `600 ${Math.max(11, W / 75)}px system-ui`;
@@ -1178,7 +1236,7 @@ function renderBev(){
   const nl = lane.nLanes ? lane.nLeft : 1, nr = lane.nLanes ? lane.nRight : 1;
   const left = egoL - nl * lw, right = egoR + nr * lw;
   // fit the whole road across the panel; keep the ego car on screen
-  const pxm = Math.min(W / 11, W / (right - left + 2.5));
+  const pxm = Math.min(W / 11, W / Math.max(6, right - left + 2.5));
   const half = W / 2 / pxm;
   const cxM = Math.max(left - 1 + half, Math.min(right + 1 - half, (left + right) / 2));
   const zy = Z => egoY - (egoY - top) * (Z / (Z + K)) / (Zmax / (Zmax + K));
@@ -1206,7 +1264,7 @@ function renderBev(){
   for (const z of [10, 20, 40, 60]) { const y = zy(z); g.fillRect(W - 8, y, 6, 1); g.fillText(US() ? Math.round(z * 3.281) + ' ft' : z + ' m', W - 12, y + 4); }
   g.textAlign = 'start';
   // vehicles
-  const rr = (x, y, w, h, r) => { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.fill(); };
+  const rr = (x, y, w, h, r) => { if (!(w > 0 && h > 0)) return; r = Math.max(0, Math.min(r, w / 2, h / 2)); g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.fill(); };
   for (const t of vtracks) {
     if (!t.ok || t.Z > Zmax + 5) continue;
     const wM = VEH[t.cls] || 1.8, lM = VLEN[t.cls] || 4.5;
