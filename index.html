@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yo'l yordamchisi — chiziq va belgilarni aniqlash</title>
+<style>
+  :root{--bg:#0d1014;--panel:#161a20;--line:#272d36;--text:#e8ebef;--muted:#8b94a1;--ok:#3ddc97;--warn:#ffb020;--bad:#ff4d4d;--blue:#4da3ff}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+  .wrap{max-width:1100px;margin:0 auto;padding:12px}
+  h1{font-size:19px;margin:4px 0}
+  .sub{color:var(--muted);font-size:13.5px;line-height:1.45;margin:0 0 10px}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+  button,label.btn{background:var(--panel);color:var(--text);border:1px solid var(--line);padding:10px 14px;border-radius:10px;font-size:14px;cursor:pointer;font-family:inherit}
+  .primary{background:var(--ok)!important;color:#05291a!important;border-color:var(--ok)!important;font-weight:600}
+  input[type=file]{display:none}
+  .stage{position:relative;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
+  canvas#view{display:block;width:100%;height:auto}
+  .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;padding:24px;font-size:14px;line-height:1.5}
+  .banner{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);padding:10px 18px;border-radius:12px;font-weight:700;font-size:clamp(15px,3.2vw,26px);color:#fff;background:rgba(255,77,77,.92);box-shadow:0 6px 24px rgba(0,0,0,.4);opacity:0;transition:opacity .2s;pointer-events:none;white-space:nowrap}
+  .banner.show{opacity:1}
+  .banner.info{background:rgba(30,120,255,.92)}
+  .msg{background:#2a1d0b;border:1px solid #5a3d10;color:#ffd38a;padding:10px 12px;border-radius:10px;font-size:13.5px;line-height:1.45;margin-bottom:10px;display:none}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-top:10px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px}
+  .stat .k{color:var(--muted);font-size:12px}
+  .stat .v{font-size:19px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+  details{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-top:10px}
+  summary{padding:12px;cursor:pointer;font-weight:600;font-size:14px}
+  .controls{padding:0 12px 12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+  .ctl label{display:flex;justify-content:space-between;font-size:13px;color:var(--muted);margin-bottom:4px}
+  .ctl input[type=range]{width:100%}
+  .chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+  .log{font-size:13px;max-height:150px;overflow:auto;padding:0 12px 12px}
+  .log div{padding:4px 0;border-bottom:1px solid var(--line);color:#cfd5dc}
+  .log span{color:var(--muted);font-variant-numeric:tabular-nums;margin-right:8px}
+  .note{color:var(--muted);font-size:12.5px;line-height:1.55;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🚗 Yo'l yordamchisi</h1>
+  <p class="sub">Yo'l chiziqlarini (polosa) aniqlaydi, chiziqdan chiqib ketayotganda ogohlantiradi va yo'l belgilarini taniydi: tezlik cheklovi, STOP, “Yo'l bering”, “Kirish taqiqlangan” va ogohlantiruvchi uchburchak. Bu o'quv prototipi. Haydash paytida diqqatingizni almashtirmaydi.</p>
+
+  <div class="msg" id="msg"></div>
+
+  <div class="bar">
+    <button class="primary" id="btnCam">📷 Kamerani yoqish</button>
+    <label class="btn" for="file">📁 Video yuklash</label>
+    <input type="file" id="file" accept="video/*">
+    <button id="btnDemo">🛣️ Demo yo'l</button>
+    <button id="btnPause">⏸ Pauza</button>
+  </div>
+
+  <div class="stage">
+    <canvas id="view" width="960" height="540"></canvas>
+    <div class="empty" id="empty">Telefonni mashina oynasiga mahkamlang (kamera oldinga, gorizont kadr o'rtasida).<br>So'ng “Kamerani yoqish”ni bosing. Sinab ko'rish uchun “Demo yo'l” yoki “Video yuklash”dan foydalaning.</div>
+    <div class="banner" id="banner"></div>
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="k">Chiziqlar</div><div class="v" id="sLane">—</div></div>
+    <div class="stat"><div class="k">Polosadagi holat</div><div class="v" id="sOff">—</div></div>
+    <div class="stat"><div class="k">Tezlik cheklovi</div><div class="v" id="sLimit">—</div></div>
+    <div class="stat"><div class="k">GPS tezlik</div><div class="v" id="sSpeed">—</div></div>
+    <div class="stat"><div class="k">FPS</div><div class="v" id="sFps">0</div></div>
+  </div>
+
+  <details>
+    <summary>⚙️ Sozlamalar</summary>
+    <div class="controls">
+      <div class="ctl"><label>Gorizont balandligi <span id="vHor">58%</span></label><input type="range" id="hor" min="35" max="75" value="58"></div>
+      <div class="ctl"><label>Kapot chegarasi (pastki) <span id="vBot">94%</span></label><input type="range" id="bot" min="70" max="100" value="94"></div>
+      <div class="ctl"><label>Chiziq sezgirligi <span id="vLthr">45</span></label><input type="range" id="lthr" min="15" max="120" value="45"></div>
+      <div class="ctl"><label>Chiqib ketish chegarasi <span id="vDep">30%</span></label><input type="range" id="dep" min="15" max="45" value="30"></div>
+      <div class="ctl"><label>Kamera markazi siljishi <span id="vOff">0%</span></label><input type="range" id="off" min="-25" max="25" value="0"></div>
+      <div class="ctl"><label>Belgi sezgirligi <span id="vSthr">35</span></label><input type="range" id="sthr" min="20" max="60" value="35"></div>
+      <div class="ctl" style="display:flex;flex-direction:column;gap:8px;justify-content:center">
+        <span class="chk"><input type="checkbox" id="snd" checked> Ovozli signal</span>
+        <span class="chk"><input type="checkbox" id="voice" checked> Ovozli xabar (gapirish)</span>
+        <span class="chk"><input type="checkbox" id="gps" checked> GPS tezlikni kuzatish</span>
+        <span class="chk"><input type="checkbox" id="dbg"> Aniqlash nuqtalarini ko'rsatish</span>
+      </div>
+    </div>
+  </details>
+
+  <details open>
+    <summary>📋 Ogohlantirishlar tarixi</summary>
+    <div class="log" id="log"></div>
+  </details>
+
+  <p class="note">
+    <b>Qanday ishlaydi:</b> chiziqlar uchun asfaltdan yorqinroq ingichka yo'llar (oq/sariq bo'yoq) qidiriladi, so'ng Hough usuli bilan chap va o'ng chiziq topiladi. Belgilar uchun qizil/ko'k rangli shakllar ajratiladi va burchaklari hamda ichki qismiga qarab turi aniqlanadi (aylana, uchburchak, sakkizburchak). Tezlik belgisidagi raqamlar namunalar bilan solishtirib o'qiladi. Belgi bir necha kadrda tasdiqlangandan keyingina xabar beriladi.<br><br>
+    <b>Cheklovlar:</b> tun, yomg'ir, chiziqlari o'chib ketgan yo'l va quyosh ro'parada bo'lganda aniqlik pasayadi. Bu xavfsizlik tizimi emas. Sozlamalarni mashina to'xtab turganda o'zgartiring.
+  </p>
+</div>
+
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const view = $('view'), ctx = view.getContext('2d');
+
+// ---------------- settings ----------------
+const P = {
+  get hor(){return +$('hor').value/100}, get bot(){return +$('bot').value/100},
+  get lthr(){return +$('lthr').value}, get dep(){return +$('dep').value/100},
+  get camOff(){return +$('off').value/100}, get sthr(){return +$('sthr').value/100},
+  get snd(){return $('snd').checked}, get voice(){return $('voice').checked},
+  get gps(){return $('gps').checked}, get dbg(){return $('dbg').checked}
+};
+[['hor','vHor','%'],['bot','vBot','%'],['lthr','vLthr',''],['dep','vDep','%'],['off','vOff','%'],['sthr','vSthr','']]
+  .forEach(([a,b,u]) => $(a).addEventListener('input', () => $(b).textContent = $(a).value + u));
+try { const saved = JSON.parse(localStorage.getItem('yy-settings') || '{}');
+  for (const k in saved) { const el = $(k); if (!el) continue; if (el.type === 'checkbox') el.checked = saved[k]; else { el.value = saved[k]; el.dispatchEvent(new Event('input')); } }
+} catch (e) {}
+document.querySelectorAll('.controls input').forEach(el => el.addEventListener('change', () => {
+  try { const o = {}; document.querySelectorAll('.controls input').forEach(i => o[i.id] = i.type === 'checkbox' ? i.checked : i.value); localStorage.setItem('yy-settings', JSON.stringify(o)); } catch (e) {}
+}));
+
+function showMsg(t){ const m = $('msg'); m.innerHTML = t; m.style.display = t ? 'block' : 'none'; }
+
+// ---------------- audio / voice / alerts ----------------
+let actx = null;
+function initAudio(){ try { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); } catch (e) {} }
+function beep(level){
+  if (!P.snd || !actx) return;
+  try {
+    const n = level === 'bad' ? 2 : 1;
+    for (let i = 0; i < n; i++) {
+      const o = actx.createOscillator(), g = actx.createGain(), t0 = actx.currentTime + i * 0.18;
+      o.frequency.value = level === 'bad' ? 880 : 660; o.type = 'square';
+      g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.25, t0 + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.14);
+      o.connect(g).connect(actx.destination); o.start(t0); o.stop(t0 + 0.16);
+    }
+  } catch (e) {}
+}
+function speak(text){
+  if (!P.voice || !('speechSynthesis' in window)) return;
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    const vs = speechSynthesis.getVoices();
+    const v = vs.find(v => /^uz/i.test(v.lang)) || vs.find(v => /^tr/i.test(v.lang));
+    if (v) { u.voice = v; u.lang = v.lang; } else u.lang = 'uz-UZ';
+    u.rate = 1.05; speechSynthesis.cancel(); speechSynthesis.speak(u);
+  } catch (e) {}
+}
+const lastAlert = {};
+let bannerTimer = null;
+function alertUser(key, text, level, cooldownMs, spoken){
+  const now = performance.now();
+  if (lastAlert[key] && now - lastAlert[key] < cooldownMs) return false;
+  lastAlert[key] = now;
+  const b = $('banner'); b.textContent = text; b.className = 'banner show' + (level === 'info' ? ' info' : '');
+  clearTimeout(bannerTimer); bannerTimer = setTimeout(() => b.className = 'banner', 2600);
+  beep(level); speak(spoken || text);
+  const row = document.createElement('div');
+  const d = new Date(); row.innerHTML = `<span>${d.toLocaleTimeString().slice(0,8)}</span>`; row.appendChild(document.createTextNode(text));
+  const log = $('log'); log.prepend(row); while (log.children.length > 40) log.lastChild.remove();
+  window.__alerts = (window.__alerts || []).concat([key]);
+  return true;
+}
+
+// ---------------- sources ----------------
+const video = document.createElement('video'); video.muted = true; video.playsInline = true;
+let mode = null, paused = false, running = false, stream = null, srcW = 960, srcH = 540, wakeLock = null;
+
+function setSource(w, h){
+  srcW = w; srcH = h;
+  const s = Math.min(1, 960 / w);
+  view.width = Math.round(w * s); view.height = Math.round(h * s);
+  LH = Math.round(LW * h / w); lc.width = LW; lc.height = LH;
+  SH = Math.round(SW * h / w); sc.width = SW; sc.height = SH;
+  G = new Float32Array(LW * LH); redM = new Uint8Array(SW * SH); bluM = new Uint8Array(SW * SH); tmpM = new Uint8Array(SW * SH); lab = new Int32Array(SW * SH);
+  resetState();
+  $('empty').style.display = 'none';
+}
+function stopAll(){
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  video.pause(); if (video.src) { URL.revokeObjectURL(video.src); video.removeAttribute('src'); }
+  video.srcObject = null;
+}
+$('btnCam').addEventListener('click', async () => {
+  initAudio(); speak('');
+  stopAll(); showMsg('');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showMsg("Bu brauzerda kameraga ruxsat yo'q. Sahifani <b>https://</b> manzil orqali Chrome yoki Safari'da alohida oching. Hozircha “Demo yo'l” yoki “Video yuklash”dan foydalaning.");
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+    video.srcObject = stream; await video.play();
+    setSource(video.videoWidth || 1280, video.videoHeight || 720); mode = 'video'; paused = false; start();
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+    startGps();
+  } catch (e) {
+    showMsg("Kamera ochilmadi (" + (e.name || 'xato') + "). Agar sahifa Claude ichida ochilgan bo'lsa, u yerda kamera bloklangan: sahifani alohida https:// havola orqali oching. Aks holda brauzer sozlamalarida kameraga ruxsat bering.");
+  }
+});
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  initAudio(); stopAll(); showMsg('');
+  video.src = URL.createObjectURL(f); video.loop = true;
+  video.onloadedmetadata = () => { setSource(video.videoWidth || 960, video.videoHeight || 540); mode = 'video'; paused = false; video.play().catch(() => {}); start(); };
+  video.onerror = () => showMsg("Videoni ochib bo'lmadi. MP4 (H.264) yoki WebM formatini sinab ko'ring.");
+  e.target.value = '';
+});
+$('btnDemo').addEventListener('click', () => { initAudio(); speak(''); stopAll(); showMsg(''); demo.reset(); setSource(960, 540); mode = 'demo'; paused = false; start(); });
+$('btnPause').addEventListener('click', () => {
+  paused = !paused; $('btnPause').textContent = paused ? '▶ Davom etish' : '⏸ Pauza';
+  if (mode === 'video' && !stream) paused ? video.pause() : video.play().catch(() => {});
+});
+
+// ---------------- GPS speed ----------------
+let gpsWatch = null, gpsSpeed = null, curLimit = null;
+function startGps(){
+  if (gpsWatch !== null || !P.gps || !navigator.geolocation) return;
+  try {
+    gpsWatch = navigator.geolocation.watchPosition(p => {
+      gpsSpeed = p.coords.speed != null ? p.coords.speed * 3.6 : null;
+      $('sSpeed').textContent = gpsSpeed != null ? Math.round(gpsSpeed) + ' km/soat' : '—';
+    }, () => { $('sSpeed').textContent = "ruxsat yo'q"; }, { enableHighAccuracy: true, maximumAge: 1000 });
+  } catch (e) {}
+}
+
+// ---------------- demo road (synthetic) ----------------
+const demoCan = document.createElement('canvas'); demoCan.width = 960; demoCan.height = 540;
+const demo = (() => {
+  const c = demoCan.getContext('2d'), W = 960, H = 540, f = 760, camH = 1.3, yh = H * 0.55;
+  let t = 0, travel = 0, carX = 0, signs = [], nextSign = 0, seq = 0;
+  const kinds = [['speed',60],['stop'],['warn'],['speed',90],['yield'],['noentry'],['speed',40],['speed',110]];
+  function proj(X, Z, Y){ return [W / 2 + f * X / Z, yh + f * (camH - (Y || 0)) / Z]; }
+  function curve(Z){ return 0.0009 * Math.sin(t * 0.15) * Z * Z; }
+  function reset(){ t = 0; travel = 0; carX = 0; signs = []; nextSign = 1.5; seq = 0; }
+  function drawSign(s, x, y, r){
+    c.fillStyle = '#777'; c.fillRect(x - r * 0.08, y, r * 0.16, f * 2.2 / s.Z);
+    c.save(); c.translate(x, y);
+    if (s.kind === 'speed' || s.kind === 'noentry') {
+      c.fillStyle = s.kind === 'noentry' ? '#d0151b' : '#fff';
+      c.beginPath(); c.arc(0, 0, r, 0, Math.PI * 2); c.fill();
+      c.lineWidth = r * 0.22; c.strokeStyle = '#d0151b'; c.beginPath(); c.arc(0, 0, r * 0.89, 0, Math.PI * 2); c.stroke();
+      if (s.kind === 'speed') {
+        const txt = String(s.val); c.fillStyle = '#111'; c.textAlign = 'center'; c.textBaseline = 'middle';
+        c.font = `bold ${r * 0.95}px Arial, Helvetica, sans-serif`;
+        c.save(); if (txt.length === 3) c.scale(0.78, 1); c.fillText(txt, 0, r * 0.05); c.restore();
+      } else { c.fillStyle = '#fff'; c.fillRect(-r * 0.62, -r * 0.16, r * 1.24, r * 0.32); }
+    } else if (s.kind === 'stop') {
+      c.fillStyle = '#d0151b'; c.beginPath();
+      for (let i = 0; i < 8; i++) { const a = Math.PI / 8 + i * Math.PI / 4; c.lineTo(Math.cos(a) * r, Math.sin(a) * r); } c.fill();
+      c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle'; c.font = `bold ${r * 0.52}px Arial`; c.fillText('STOP', 0, r * 0.03);
+    } else if (s.kind === 'warn' || s.kind === 'yield') {
+      const up = s.kind === 'warn' ? 1 : -1, h = r * 1.73;
+      const tri = (k) => { c.beginPath(); c.moveTo(0, -up * h * 0.6 * k); c.lineTo(r * k, up * h * 0.4 * k); c.lineTo(-r * k, up * h * 0.4 * k); c.closePath(); };
+      c.fillStyle = '#d0151b'; tri(1); c.fill(); c.fillStyle = s.kind === 'warn' ? '#fff' : '#fff'; tri(0.62); c.fill();
+      if (s.kind === 'warn') { c.fillStyle = '#111'; c.fillRect(-r * 0.07, -r * 0.35, r * 0.14, r * 0.5); c.fillRect(-r * 0.07, r * 0.25, r * 0.14, r * 0.13); }
+    }
+    c.restore();
+  }
+  function frame(){
+    t += 1 / 30; travel += 0.6;
+    // gentle drift with occasional departures
+    carX = 0.75 * Math.sin(t * 0.33) + 0.45 * Math.sin(t * 0.11 + 1);
+    const sky = c.createLinearGradient(0, 0, 0, yh); sky.addColorStop(0, '#7fb2e0'); sky.addColorStop(1, '#d7e6f0');
+    c.fillStyle = sky; c.fillRect(0, 0, W, yh);
+    c.fillStyle = '#6f8a55'; c.fillRect(0, yh, W, H - yh);
+    // trees / horizon blobs
+    c.fillStyle = '#4f6a3c'; for (let i = 0; i < 14; i++) { const x = (i * 97 + 30) % W; c.beginPath(); c.arc(x, yh - 6, 18 + (i % 3) * 8, Math.PI, 0); c.fill(); }
+    // road surface
+    const Zs = []; for (let Z = 2.2; Z < 140; Z *= 1.04) Zs.push(Z);
+    const edge = (X) => Zs.map(Z => proj(X + curve(Z) - carX, Z));
+    const L = edge(-6.2), R = edge(3.0);
+    c.fillStyle = '#4a4c50'; c.beginPath(); L.forEach(p => c.lineTo(p[0], p[1])); R.slice().reverse().forEach(p => c.lineTo(p[0], p[1])); c.fill();
+    const paint = (X, dashed, col) => {
+      c.fillStyle = col;
+      for (let i = 0; i < Zs.length - 1; i++) {
+        const Z0 = Zs[i], Z1 = Zs[i + 1];
+        if (dashed && Math.floor((Z0 + travel) / 4.5) % 2) continue;
+        const a = proj(X - 0.07 + curve(Z0) - carX, Z0), b = proj(X + 0.07 + curve(Z0) - carX, Z0);
+        const cc = proj(X + 0.07 + curve(Z1) - carX, Z1), d = proj(X - 0.07 + curve(Z1) - carX, Z1);
+        c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]); c.lineTo(cc[0], cc[1]); c.lineTo(d[0], d[1]); c.fill();
+      }
+    };
+    paint(-5.4, false, '#e8e8e8'); paint(-1.8, true, '#f0f0f0'); paint(1.8, false, '#e9d36a');
+    // signs
+    if (t > nextSign) { const k = kinds[seq++ % kinds.length]; signs.push({ kind: k[0], val: k[1], Z: 75, X: 4.3 }); nextSign = t + 4.2; }
+    for (const s of signs) s.Z -= 0.6;
+    signs = signs.filter(s => s.Z > 3);
+    for (const s of signs.slice().sort((a, b) => b.Z - a.Z)) {
+      const [x, y] = proj(s.X + curve(s.Z) - carX, s.Z, 2.3); const r = f * 0.36 / s.Z;
+      drawSign(s, x, y, r);
+    }
+    // hood
+    c.fillStyle = '#1d2329'; c.beginPath(); c.moveTo(0, H); c.lineTo(0, H * 0.965); c.quadraticCurveTo(W / 2, H * 0.93, W, H * 0.965); c.lineTo(W, H); c.fill();
+  }
+  return { reset, frame, get carX(){ return carX; } };
+})();
+
+// ---------------- lane detection ----------------
+const LW = 320; let LH = 180;
+const lc = document.createElement('canvas'); const lctx = lc.getContext('2d', { willReadFrequently: true });
+let G = null;
+const PHIS = []; for (let a = 12; a <= 72; a += 2) PHIS.push(Math.tan(a * Math.PI / 180));
+const BIN = 3, XMIN = -LW * 0.6, NB = Math.ceil(LW * 2.2 / BIN);
+const accL = new Float32Array(PHIS.length * NB), accR = new Float32Array(PHIS.length * NB);
+const lane = { L: { line: null, cand: null, lost: 99, jump: 0 }, R: { line: null, cand: null, lost: 99, jump: 0 }, width: null, depFrames: 0, offset: null };
+let feats = [];
+
+function detectLanes(src){
+  lctx.drawImage(src, 0, 0, LW, LH);
+  const d = lctx.getImageData(0, 0, LW, LH).data;
+  const yT = Math.round(LH * P.hor), yB = Math.round(LH * P.bot) - 1;
+  for (let y = yT; y <= yB; y++) for (let x = 0; x < LW; x++) {
+    const i = y * LW + x, r = d[i*4], g = d[i*4+1], b = d[i*4+2];
+    let v = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (r > 130 && g > 100 && b < g * 0.75 && r - b > 50) v = Math.max(v, 215); // yellow paint
+    G[i] = v;
+  }
+  feats = [];
+  const thr = P.lthr, sc = LW / 320;
+  for (let y = yT; y <= yB; y++) {
+    const t = (y - yT) / Math.max(1, yB - yT);
+    const k = Math.max(2, Math.round((1.5 + 7 * t) * sc));
+    const row = y * LW;
+    for (let x = k; x < LW - k; x++) {
+      const c = G[row + x], l = G[row + x - k], r = G[row + x + k];
+      const v = 2 * c - l - r - Math.abs(l - r);
+      if (v > thr && c > 90) feats.push(x, y, Math.min(v, 200));
+    }
+  }
+  accL.fill(0); accR.fill(0);
+  for (let i = 0; i < feats.length; i += 3) {
+    const x = feats[i], dy = yB - feats[i + 1], w = feats[i + 2];
+    for (let p = 0; p < PHIS.length; p++) {
+      const o = dy * PHIS[p];
+      const bl = Math.round((x - o - XMIN) / BIN), br = Math.round((x + o - XMIN) / BIN);
+      if (bl >= 0 && bl < NB) accL[p * NB + bl] += w;
+      if (br >= 0 && br < NB) accR[p * NB + br] += w;
+    }
+  }
+  const rows = Math.max(1, yB - yT);
+  const peak = (acc, lo, hi, sign) => {
+    let best = 0, bp = -1, bb = -1;
+    const b0 = Math.max(1, Math.round((lo - XMIN) / BIN)), b1 = Math.min(NB - 2, Math.round((hi - XMIN) / BIN));
+    for (let p = 0; p < PHIS.length; p++) for (let b = b0; b <= b1; b++) {
+      const v = acc[p * NB + b] + 0.5 * (acc[p * NB + b - 1] + acc[p * NB + b + 1]);
+      if (v > best) { best = v; bp = p; bb = b; }
+    }
+    const score = best / rows / 160;
+    if (bp < 0 || score < 0.35) return null;
+    return { xb: bb * BIN + XMIN, t: sign * PHIS[bp], score };
+  };
+  let detL = peak(accL, -LW * 0.5, LW * 0.5, 1);
+  let detR = peak(accR, LW * 0.5, LW * 1.5, -1);
+  // lines must not cross inside the region of interest (sanity check)
+  if (detL && detR) {
+    const xTopL = detL.xb + detL.t * rows, xTopR = detR.xb + detR.t * rows;
+    if (xTopL > xTopR + LW * 0.05) { if (detL.score < detR.score) detL = null; else detR = null; }
+  }
+  track(lane.L, detL); track(lane.R, detR);
+  return { yT, yB };
+}
+function track(s, det){
+  const close = (a, b) => Math.abs(a.xb - b.xb) < LW * 0.1 && Math.abs(Math.atan(a.t) - Math.atan(b.t)) < 0.18;
+  if (det) {
+    if (!s.line) {
+      s.cand = s.cand && close(s.cand, det) ? { ...det, n: s.cand.n + 1 } : { ...det, n: 1 };
+      s.lost = 0;
+      if (s.cand.n >= 3) s.line = { xb: det.xb, t: det.t };
+    } else if (close(s.line, det)) {
+      s.line.xb += (det.xb - s.line.xb) * 0.35; s.line.t += (det.t - s.line.t) * 0.35; s.lost = 0; s.jump = 0;
+    } else if (++s.jump >= 4) { s.line = { xb: det.xb, t: det.t }; s.jump = 0; s.lost = 0; }
+    else s.lost++;
+  } else s.lost++;
+  if (s.lost > 12) { s.line = null; s.cand = null; }
+}
+function laneLogic(){
+  const L = lane.L.line, R = lane.R.line;
+  const carX = LW * (0.5 + P.camOff);
+  let off = null;
+  if (L && R) {
+    const w = R.xb - L.xb;
+    if (w > LW * 0.3 && w < LW * 1.6) { lane.width = lane.width ? lane.width * 0.95 + w * 0.05 : w; off = (carX - (L.xb + R.xb) / 2) / w; }
+  } else if (L && lane.width) off = (carX - (L.xb + lane.width / 2)) / lane.width;
+  else if (R && lane.width) off = (carX - (R.xb - lane.width / 2)) / lane.width;
+  lane.offset = off;
+  if (off !== null && Math.abs(off) > P.dep) lane.depFrames++; else lane.depFrames = Math.max(0, lane.depFrames - 2);
+  if (lane.depFrames >= 6) {
+    if (off < 0) alertUser('lane-left', "⚠️ Chap chiziqqa yaqinlashdingiz", 'bad', 3500, "Chap chiziq");
+    else alertUser('lane-right', "⚠️ O'ng chiziqqa yaqinlashdingiz", 'bad', 3500, "O'ng chiziq");
+  }
+  $('sLane').textContent = (L ? 'Chap ✓' : 'Chap ✗') + '  ' + (R ? "O'ng ✓" : "O'ng ✗");
+  $('sOff').textContent = off === null ? '—' : (Math.abs(off) > P.dep ? (off < 0 ? '← chapda' : "o'ngda →") : 'markazda ✓');
+}
+
+// ---------------- sign detection ----------------
+const SW = 480; let SH = 270;
+const sc = document.createElement('canvas'); const sctx = sc.getContext('2d', { willReadFrequently: true });
+let redM = null, bluM = null, tmpM = null, lab = null;
+const crop = document.createElement('canvas'); crop.width = crop.height = 96;
+const cctx = crop.getContext('2d', { willReadFrequently: true });
+let signCands = [], signTracks = [], frameNo = 0;
+
+function dilate(src, dst, w, h){
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = 0;
+    for (let dy = -1; dy <= 1 && !v; dy++) { const yy = y + dy; if (yy < 0 || yy >= h) continue;
+      for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx >= 0 && xx < w && src[yy * w + xx]) { v = 1; break; } } }
+    dst[y * w + x] = v;
+  }
+}
+function blobs(mask, w, h, yMax){
+  lab.fill(0); const out = [], st = []; let L = 0;
+  for (let i = 0; i < w * yMax; i++) {
+    if (!mask[i] || lab[i]) continue;
+    L++; let n = 0, x0 = w, y0 = h, x1 = 0, y1 = 0; st.push(i); lab[i] = L;
+    while (st.length) {
+      const j = st.pop(), x = j % w, y = (j / w) | 0; n++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (x > 0 && mask[j - 1] && !lab[j - 1]) { lab[j - 1] = L; st.push(j - 1); }
+      if (x < w - 1 && mask[j + 1] && !lab[j + 1]) { lab[j + 1] = L; st.push(j + 1); }
+      if (y > 0 && mask[j - w] && !lab[j - w]) { lab[j - w] = L; st.push(j - w); }
+      if (y < h - 1 && mask[j + w] && !lab[j + w]) { lab[j + w] = L; st.push(j + w); }
+    }
+    out.push({ x0, y0, x1, y1, n, w: x1 - x0 + 1, h: y1 - y0 + 1 });
+  }
+  return out;
+}
+function frac(m, w, b, fx0, fy0, fx1, fy1){
+  const X0 = Math.floor(b.x0 + fx0 * b.w), X1 = Math.max(X0 + 1, Math.ceil(b.x0 + fx1 * b.w));
+  const Y0 = Math.floor(b.y0 + fy0 * b.h), Y1 = Math.max(Y0 + 1, Math.ceil(b.y0 + fy1 * b.h));
+  let s = 0, n = 0;
+  for (let y = Y0; y < Y1; y++) for (let x = X0; x < X1; x++) { s += m[y * w + x]; n++; }
+  return n ? s / n : 0;
+}
+function classify(m, raw, b){
+  const ar = b.w / b.h;
+  if (ar < 0.6 || ar > 1.6) return null;
+  const c = 0.16;
+  // outline measurements on the dilated mask, interior measurements on the raw mask
+  const TL = frac(m, SW, b, 0, 0, c, c), TR = frac(m, SW, b, 1 - c, 0, 1, c), BL = frac(m, SW, b, 0, 1 - c, c, 1), BR = frac(m, SW, b, 1 - c, 1 - c, 1, 1);
+  const fill = frac(m, SW, b, 0, 0, 1, 1);
+  const topMid = frac(m, SW, b, 0.4, 0, 0.6, 0.18), botMid = frac(m, SW, b, 0.4, 0.82, 0.6, 1);
+  const ringEdge = (frac(m, SW, b, 0, 0.4, 0.12, 0.6) + frac(m, SW, b, 0.88, 0.4, 1, 0.6) + topMid + botMid) / 4;
+  const center = frac(raw, SW, b, 0.36, 0.36, 0.64, 0.64);
+  const band = frac(raw, SW, b, 0.28, 0.45, 0.72, 0.55);
+  const above = frac(raw, SW, b, 0.35, 0.2, 0.65, 0.32), below = frac(raw, SW, b, 0.35, 0.68, 0.65, 0.8);
+  const T = P.sthr;
+  const cornersEmpty = TL < 0.22 && TR < 0.22 && BL < 0.22 && BR < 0.22;
+  if (cornersEmpty && ringEdge > 0.55) {
+    if (center < 0.15 && above < 0.5 && below < 0.5) return 'ring';
+    if (band < 0.35 && above > 0.6 && below > 0.6) return 'noentry';
+    if (fill > 0.6 && center > 0.3) return 'stop';
+    return null;
+  }
+  if (fill > 0.8) return null;
+  if (TL < 0.15 && TR < 0.15 && BL > T && BR > T && topMid > 0.25 && botMid > 0.5) return 'warn';
+  if (BL < 0.15 && BR < 0.15 && TL > T && TR > T && botMid > 0.25 && topMid > 0.5) return 'yield';
+  return null;
+}
+function detectSigns(src){
+  sctx.drawImage(src, 0, 0, SW, SH);
+  const d = sctx.getImageData(0, 0, SW, SH).data;
+  const yMax = Math.round(SH * Math.min(0.8, P.hor + 0.12));
+  for (let i = 0; i < SW * SH; i++) {
+    const r = d[i*4], g = d[i*4+1], b = d[i*4+2], mx = Math.max(g, b);
+    redM[i] = (i < SW * yMax && r > 70 && r - mx > 0.38 * r) ? 1 : 0;
+  }
+  dilate(redM, tmpM, SW, SH);
+  const cands = [];
+  for (const b of blobs(tmpM, SW, SH, yMax)) {
+    if (b.w < 10 || b.h < 10 || b.w > SW * 0.3 || b.h > SH * 0.4 || b.n < 30) continue;
+    const kind = classify(tmpM, redM, b); if (!kind) continue;
+    const cand = { kind, cx: (b.x0 + b.w / 2) / SW, cy: (b.y0 + b.h / 2) / SH, w: b.w / SW, h: b.h / SH, val: null };
+    if (kind === 'ring') {
+      cand.val = readNumber(src, cand);
+      if (cand.val) cand.kind = 'speed';
+    }
+    cands.push(cand);
+  }
+  return cands;
+}
+
+// digit templates rendered at runtime
+const TW = 10, TH = 16; let TPL = null;
+function norm(grid){ let m = 0; for (const v of grid) m += v; m /= grid.length; let s = 0; const o = grid.map(v => { const z = v - m; s += z * z; return z; }); s = Math.sqrt(s) || 1; return o.map(v => v / s); }
+function sample(mask, w, x0, y0, x1, y1){
+  const g = new Float32Array(TW * TH), bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+  for (let ty = 0; ty < TH; ty++) for (let tx = 0; tx < TW; tx++) {
+    const sx0 = x0 + Math.floor(tx * bw / TW), sx1 = x0 + Math.max(Math.floor(tx * bw / TW) + 1, Math.floor((tx + 1) * bw / TW));
+    const sy0 = y0 + Math.floor(ty * bh / TH), sy1 = y0 + Math.max(Math.floor(ty * bh / TH) + 1, Math.floor((ty + 1) * bh / TH));
+    let s = 0, n = 0; for (let y = sy0; y < sy1; y++) for (let x = sx0; x < sx1; x++) { s += mask[y * w + x]; n++; }
+    g[ty * TW + tx] = n ? s / n : 0;
+  }
+  return norm(Array.from(g));
+}
+function buildTemplates(){
+  const c = document.createElement('canvas'); c.width = 90; c.height = 120; const x = c.getContext('2d', { willReadFrequently: true });
+  TPL = [];
+  for (const font of ['bold 100px Arial, Helvetica, sans-serif', 'bold 100px "Arial Narrow", "Roboto Condensed", sans-serif', 'bold 100px "DejaVu Sans", Verdana, sans-serif']) {
+    for (let dgt = 0; dgt <= 9; dgt++) {
+      x.fillStyle = '#fff'; x.fillRect(0, 0, 90, 120); x.fillStyle = '#000'; x.font = font; x.textBaseline = 'middle'; x.textAlign = 'center';
+      x.fillText(String(dgt), 45, 62);
+      const dd = x.getImageData(0, 0, 90, 120).data, m = new Uint8Array(90 * 120);
+      let x0 = 90, y0 = 120, x1 = 0, y1 = 0;
+      for (let i = 0; i < m.length; i++) if (dd[i*4] < 128) { m[i] = 1; const px = i % 90, py = (i / 90) | 0; if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py; }
+      TPL.push({ d: dgt, g: sample(m, 90, x0, y0, x1, y1), ar: (x1 - x0 + 1) / (y1 - y0 + 1) });
+    }
+  }
+}
+const VALID = new Set([5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130]);
+function readNumber(src, cand){
+  const S = 96;
+  const sx = (cand.cx - cand.w / 2) * srcW, sy = (cand.cy - cand.h / 2) * srcH, sw = cand.w * srcW, sh = cand.h * srcH;
+  if (sw < 22) return null;
+  cctx.drawImage(src, sx, sy, sw, sh, 0, 0, S, S);
+  const d = cctx.getImageData(0, 0, S, S).data;
+  const g = new Float32Array(S * S); let mn = 255, mx = 0;
+  const R2 = (S * 0.37) ** 2, c0 = S / 2;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const i = y * S + x; const v = d[i*4] * 0.299 + d[i*4+1] * 0.587 + d[i*4+2] * 0.114; g[i] = v;
+    if ((x - c0) ** 2 + (y - c0) ** 2 < R2) { if (v < mn) mn = v; if (v > mx) mx = v; }
+  }
+  if (mx - mn < 60) return null;
+  const th = (mn + mx) / 2, m = new Uint8Array(S * S);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) { const i = y * S + x; m[i] = ((x - c0) ** 2 + (y - c0) ** 2 < R2 && g[i] < th && d[i*4] - Math.max(d[i*4+1], d[i*4+2]) < 60) ? 1 : 0; }
+  // connected components on the small crop
+  const L = new Int32Array(S * S), st = [], comps = []; let n = 0;
+  for (let i = 0; i < S * S; i++) {
+    if (!m[i] || L[i]) continue; n++; let x0 = S, y0 = S, x1 = 0, y1 = 0, cnt = 0; st.push(i); L[i] = n;
+    while (st.length) { const j = st.pop(), x = j % S, y = (j / S) | 0; cnt++;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (const k of [j - 1, j + 1, j - S, j + S]) if (k >= 0 && k < S * S && m[k] && !L[k] && Math.abs((k % S) - x) <= 1) { L[k] = n; st.push(k); } }
+    const h = y1 - y0 + 1, w = x1 - x0 + 1;
+    if (h > S * 0.22 && h < S * 0.7 && w < S * 0.45 && cnt > 12) comps.push({ x0, y0, x1, y1, h, w });
+  }
+  // two touching digits (e.g. "11") form one wide blob: split at the thinnest column
+  for (let i = comps.length - 1; i >= 0; i--) {
+    const cp = comps[i];
+    if (cp.w / cp.h < 0.8) continue;
+    let bx = -1, bs = 1e9;
+    for (let x = cp.x0 + Math.round(cp.w * 0.3); x <= cp.x0 + Math.round(cp.w * 0.7); x++) {
+      let s = 0; for (let y = cp.y0; y <= cp.y1; y++) s += m[y * S + x];
+      if (s < bs) { bs = s; bx = x; }
+    }
+    const part = (x0, x1) => { let y0 = S, y1 = 0; for (let y = cp.y0; y <= cp.y1; y++) for (let x = x0; x <= x1; x++) if (m[y * S + x]) { if (y < y0) y0 = y; if (y > y1) y1 = y; } return { x0, x1, y0, y1, w: x1 - x0 + 1, h: y1 - y0 + 1 }; };
+    comps.splice(i, 1, part(cp.x0, bx - 1), part(bx + 1, cp.x1));
+  }
+  if (comps.length < 1 || comps.length > 3) return null;
+  comps.sort((a, b) => a.x0 - b.x0);
+  const hMed = comps.map(c => c.h).sort((a, b) => a - b)[comps.length >> 1];
+  if (comps.some(c => Math.abs(c.h - hMed) > hMed * 0.3)) return null;
+  let str = '', total = 0;
+  for (const cp of comps) {
+    const gr = sample(m, S, cp.x0, cp.y0, cp.x1, cp.y1), ar = cp.w / cp.h;
+    let best = -2, bd = null;
+    for (const t of TPL) {
+      let s = 0; for (let i = 0; i < gr.length; i++) s += gr[i] * t.g[i];
+      s -= Math.abs(ar - t.ar) * 0.6;
+      if (s > best) { best = s; bd = t.d; }
+    }
+    // a thin stroke ("1") gives weak correlation: accept by shape
+    if (ar < 0.38) { bd = 1; best = Math.max(best, 0.7); }
+    str += bd; total += best;
+  }
+  const val = parseInt(str, 10);
+  if (total / comps.length < 0.55 || !VALID.has(val)) return null;
+  return val;
+}
+
+const NAMES = { stop: 'STOP — to\'xtang', yield: "Yo'l bering", noentry: 'Kirish taqiqlangan', warn: 'Ogohlantiruvchi belgi', ring: 'Taqiqlovchi belgi' };
+const SPOKEN = { stop: "To'xtang. Stop belgisi", yield: "Yo'l bering", noentry: "Kirish taqiqlangan", warn: "Diqqat. Ogohlantiruvchi belgi" };
+function updateSignTracks(cands){
+  frameNo++;
+  for (const c of cands) {
+    let best = null, bd = 1e9;
+    for (const t of signTracks) {
+      const sameFamily = t.kind === c.kind || ((t.kind === 'ring' || t.kind === 'speed') && (c.kind === 'ring' || c.kind === 'speed'));
+      if (!sameFamily) continue;
+      const dd = Math.hypot(c.cx - t.cx, c.cy - t.cy);
+      if (dd < 0.06 + t.w * 1.5 && dd < bd) { bd = dd; best = t; }
+    }
+    if (!best) { best = { kind: c.kind, cx: c.cx, cy: c.cy, w: c.w, h: c.h, seen: 0, votes: {}, announced: false, last: frameNo }; signTracks.push(best); }
+    best.cx = c.cx; best.cy = c.cy; best.w = c.w; best.h = c.h; best.seen++; best.last = frameNo;
+    if (c.kind === 'speed') { best.votes[c.val] = (best.votes[c.val] || 0) + 1; best.kind = 'speed'; }
+  }
+  signTracks = signTracks.filter(t => frameNo - t.last < 10);
+  for (const t of signTracks) {
+    if (t.announced || t.seen < 3) continue;
+    if (t.kind === 'speed' || t.kind === 'ring') {
+      let bv = null, bc = 0; for (const v in t.votes) if (t.votes[v] > bc) { bc = t.votes[v]; bv = +v; }
+      if (bv && bc >= 2) {
+        t.val = bv; t.announced = true; curLimit = bv; $('sLimit').textContent = bv + ' km/soat';
+        alertUser('speed-' + bv, `🚫 Tezlik cheklovi: ${bv} km/soat`, 'info', 8000, `Tezlik cheklovi ${bv}`);
+      }
+    } else if (SPOKEN[t.kind]) {
+      t.announced = true;
+      alertUser('sign-' + t.kind, (t.kind === 'warn' ? '⚠️ ' : '🛑 ') + NAMES[t.kind], t.kind === 'warn' ? 'info' : 'bad', 6000, SPOKEN[t.kind]);
+    }
+  }
+  if (curLimit && gpsSpeed != null && gpsSpeed > curLimit + 5)
+    alertUser('overspeed', `🐢 Tezlikni kamaytiring: ${Math.round(gpsSpeed)} > ${curLimit}`, 'bad', 10000, 'Tezlikni kamaytiring');
+}
+
+// ---------------- render ----------------
+function drawLimitIcon(x, y, r, v){
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.lineWidth = r * 0.2; ctx.strokeStyle = '#d0151b'; ctx.beginPath(); ctx.arc(x, y, r * 0.88, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = '#111'; ctx.font = `bold ${r * (String(v).length > 2 ? 0.72 : 0.9)}px Arial`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(v, x, y + 1);
+  ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+}
+function render(src, roi){
+  const W = view.width, H = view.height, kx = W / LW, ky = H / LH;
+  ctx.drawImage(src, 0, 0, W, H);
+  const { yT, yB } = roi;
+  if (P.dbg) {
+    ctx.fillStyle = 'rgba(0,255,200,.7)';
+    for (let i = 0; i < feats.length; i += 3) ctx.fillRect(feats[i] * kx, feats[i + 1] * ky, kx, ky);
+    ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.setLineDash([6, 6]);
+    ctx.beginPath(); ctx.moveTo(0, yT * ky); ctx.lineTo(W, yT * ky); ctx.moveTo(0, yB * ky); ctx.lineTo(W, yB * ky); ctx.stroke(); ctx.setLineDash([]);
+  }
+  const L = lane.L.line, R = lane.R.line, rows = yB - yT;
+  const xAt = (ln, y) => (ln.xb + ln.t * (yB - y)) * kx;
+  const warn = lane.depFrames >= 6;
+  const yTop = yT + rows * 0.12;
+  if (L && R) {
+    ctx.fillStyle = warn ? 'rgba(255,77,77,.28)' : 'rgba(61,220,151,.25)';
+    ctx.beginPath(); ctx.moveTo(xAt(L, yB), yB * ky); ctx.lineTo(xAt(L, yTop), yTop * ky); ctx.lineTo(xAt(R, yTop), yTop * ky); ctx.lineTo(xAt(R, yB), yB * ky); ctx.fill();
+  }
+  ctx.lineWidth = Math.max(4, W / 160); ctx.lineCap = 'round';
+  for (const ln of [L, R]) if (ln) {
+    ctx.strokeStyle = warn ? '#ff4d4d' : '#3ddc97';
+    ctx.beginPath(); ctx.moveTo(xAt(ln, yB), yB * ky); ctx.lineTo(xAt(ln, yTop), yTop * ky); ctx.stroke();
+  }
+  // car center marker
+  const cx = W * (0.5 + P.camOff);
+  ctx.strokeStyle = 'rgba(255,255,255,.8)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx, H * P.bot - 4); ctx.lineTo(cx, H * P.bot - 26); ctx.stroke();
+  // signs
+  ctx.font = `600 ${Math.max(12, W / 70)}px system-ui`;
+  for (const t of signTracks) {
+    if (t.seen < 2) continue;
+    const x = (t.cx - t.w / 2) * W, y = (t.cy - t.h / 2) * H, w = t.w * W, h = t.h * H;
+    ctx.strokeStyle = t.announced ? '#ffb020' : 'rgba(255,255,255,.7)'; ctx.lineWidth = 2; ctx.strokeRect(x - 3, y - 3, w + 6, h + 6);
+    const label = t.kind === 'speed' && t.val ? t.val + ' km/soat' : (NAMES[t.kind] || '');
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = 'rgba(0,0,0,.65)'; ctx.fillRect(x - 3, y - 26, tw + 10, 20);
+    ctx.fillStyle = '#fff'; ctx.fillText(label, x + 2, y - 11);
+  }
+  if (curLimit) drawLimitIcon(W * 0.07, H * 0.12, Math.max(22, W * 0.045), curLimit);
+  if (gpsSpeed != null) {
+    ctx.fillStyle = 'rgba(0,0,0,.55)'; ctx.fillRect(W - W * 0.17, H * 0.05, W * 0.15, H * 0.13);
+    ctx.fillStyle = curLimit && gpsSpeed > curLimit + 5 ? '#ff4d4d' : '#fff'; ctx.font = `700 ${W * 0.04}px system-ui`; ctx.textAlign = 'center';
+    ctx.fillText(Math.round(gpsSpeed), W - W * 0.095, H * 0.135); ctx.font = `500 ${W * 0.016}px system-ui`; ctx.fillText('km/soat', W - W * 0.095, H * 0.165); ctx.textAlign = 'start';
+  }
+}
+
+// ---------------- main loop ----------------
+function resetState(){
+  lane.L = { line: null, cand: null, lost: 99, jump: 0 }; lane.R = { line: null, cand: null, lost: 99, jump: 0 };
+  lane.width = null; lane.depFrames = 0; signTracks = []; curLimit = null; $('sLimit').textContent = '—';
+}
+let lastT = 0, fpsAcc = 0, fpsN = 0, tick = 0, lastRoi = { yT: 0, yB: 0 };
+function loop(now){
+  if (!running) return;
+  requestAnimationFrame(loop);
+  if (paused) { lastT = now; return; }
+  const dt = now - lastT; lastT = now; fpsAcc += dt; fpsN++;
+  if (fpsAcc > 600) { $('sFps').textContent = Math.round(1000 * fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; }
+  let src;
+  if (mode === 'demo') { demo.frame(); src = demoCan; }
+  else if (video.readyState >= 2) src = video; else return;
+  lastRoi = detectLanes(src); laneLogic();
+  if (++tick % 2 === 0) updateSignTracks(detectSigns(src));
+  render(src, lastRoi);
+}
+function start(){
+  if (!TPL) buildTemplates();
+  $('btnPause').textContent = '⏸ Pauza';
+  if (!running) { running = true; lastT = performance.now(); requestAnimationFrame(loop); }
+}
+if (!window.isSecureContext) showMsg("Kamera ishlashi uchun sahifa <b>https://</b> orqali ochilishi kerak.");
+})();
+</script>
+</body>
+</html>
