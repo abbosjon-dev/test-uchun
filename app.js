@@ -116,6 +116,7 @@ function setSource(w, h){
   const s = Math.min(1, 1280 / w);
   view.width = Math.round(w * s); view.height = Math.round(h * s);
   LH = Math.round(LW * h / w); lc.width = LW; lc.height = LH; G = new Float32Array(LW * LH);
+  rowStart = new Int32Array(LH); rowEnd = new Int32Array(LH); rowMot = new Float32Array(LH); prevG = null;
   SH = Math.round(SW * h / w); sc.width = SW; sc.height = SH;
   redM = new Uint8Array(SW * SH); whM = new Uint8Array(SW * SH); yeM = new Uint8Array(SW * SH); darkM = new Uint8Array(SW * SH);
   tmpM = new Uint8Array(SW * SH); labA = new Int32Array(SW * SH);
@@ -183,70 +184,92 @@ function egoKmh(){
 }
 
 // ===================================================================
-// Calibration (vanishing point + camera height)
+// Calibration (vanishing point, camera height, hood line)
 // ===================================================================
-const LW = 320; let LH = 180;
-const cal = { vpx: LW / 2, vpy: 90, camH: 1.3, conf: 0, n: 0 };
+const LW = 400; let LH = 225;
+const cal = { vpx: LW / 2, vpy: 112, camH: 1.3, conf: 0, n: 0, hN: 0, hoodY: null };
 function resetCalibration(){
-  cal.vpx = LW / 2; cal.vpy = LH * P.hor; cal.camH = P.camH; cal.conf = 0; cal.n = 0;
+  cal.vpx = LW / 2; cal.vpy = LH * P.hor; cal.camH = P.camH; cal.conf = 0; cal.n = 0; cal.hN = 0; cal.hoodY = null;
+  if (rowMot) rowMot.fill(0); prevG = null;
 }
-const fpx = () => (LW / 2) / Math.tan(P.fov / 2);    // focal length in lane-buffer pixels
+// FOV setting = horizontal FOV of the camera held in landscape. In portrait the image is the narrow side.
+function fovEff(){
+  const f = P.fov;
+  return srcH > srcW ? 2 * Math.atan(Math.tan(f / 2) * srcW / srcH) : f;
+}
+const fpx = () => (LW / 2) / Math.tan(fovEff() / 2);    // focal length in lane-buffer pixels
 function groundToImage(X, Z){ const f = fpx(); return [cal.vpx + f * X / Z, cal.vpy + f * cal.camH / Z]; }
+function imageToGround(x, y){ const dy = y - cal.vpy; if (dy < 0.5) return null; const Z = fpx() * cal.camH / dy; return { Z, X: (x - cal.vpx) * cal.camH / dy }; }
+function bottomY(){
+  const manual = Math.min(LH - 2, Math.round(LH * P.bot) - 1);
+  if (P.auto && cal.hoodY !== null) return Math.max(Math.round(cal.vpy + (LH - cal.vpy) * 0.3), Math.min(manual, Math.round(cal.hoodY) - 2));
+  return manual;
+}
 
 // ===================================================================
-// Lane detection
+// Lane detection: paint features → near-field Hough (ego lines, calibration)
+// → curved tracking far up the road → ground-plane curve fit → all lanes
 // ===================================================================
 const lc = document.createElement('canvas'); const lctx = lc.getContext('2d', { willReadFrequently: true });
-let G = null, feats = [];
-const PHIS = []; for (let a = 8; a <= 78; a += 2) PHIS.push(Math.tan(a * Math.PI / 180));
+let G = null, prevG = null, rowMot = null, feats = [], rowStart = null, rowEnd = null;
+const PHIS = []; for (let a = 6; a <= 80; a += 2) PHIS.push(Math.tan(a * Math.PI / 180));
 const BIN = 3, XMIN = -LW * 0.8, NB = Math.ceil(LW * 2.6 / BIN);
 const accL = new Float32Array(PHIS.length * NB), accR = new Float32Array(PHIS.length * NB);
-const HB = 0.15, HX0 = -16, HN = Math.round(32 / HB);
+const accL2 = new Float32Array(PHIS.length * NB), accR2 = new Float32Array(PHIS.length * NB);
+const HB = 0.15, HX0 = -20, HN = Math.round(40 / HB);
 const hist = new Float32Array(HN);
-const lane = { L: null, R: null, width: null, depFrames: 0, offset: null, marks: [], egoL: null, egoR: null, nLanes: null, egoIdx: null, laneHist: [] };
-const mkSide = () => ({ line: null, cand: null, lost: 99, jump: 0 });
-lane.L = mkSide(); lane.R = mkSide();
-let roi = { yT: 0, yB: 0 };
+const mkSide = () => ({ line: null, cand: null, lost: 99, jump: 0, curve: null, pts: [] });
+const lane = { L: mkSide(), R: mkSide(), width: null, depFrames: 0, offset: null, marks: [], egoL: null, egoR: null,
+               nLanes: null, nLeft: 0, nRight: 0, egoIdx: null, laneHist: [], b: 0, c: 0, zNear: 4 };
+let roi = { yT: 0, yB: 0 }, frameCount = 0;
 
 function detectLanes(src){
   lctx.drawImage(src, 0, 0, LW, LH);
   const d = lctx.getImageData(0, 0, LW, LH).data;
-  const yB = Math.min(LH - 2, Math.round(LH * P.bot) - 1);
-  const yT = Math.max(2, Math.round(cal.vpy + (yB - cal.vpy) * 0.1));
+  const yB = bottomY();
+  const yT = Math.max(2, Math.round(cal.vpy + 2));
   roi = { yT, yB };
   if (yB - yT < 12) return;
-  for (let y = yT; y <= yB; y++) for (let x = 0; x < LW; x++) {
+  const y0 = Math.max(0, Math.round(cal.vpy));
+  for (let y = y0; y < LH; y++) for (let x = 0; x < LW; x++) {
     const i = y * LW + x, r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
     let v = 0.299 * r + 0.587 * g + 0.114 * b;
     if (r > 120 && g > 90 && b < g * 0.78 && r - b > 45) v = Math.max(v, 215);  // yellow paint
     G[i] = v;
   }
-  feats = [];
+  autoHood(y0);
+  // --- paint features: thin bright ridges, width matched to perspective ---
+  feats = []; rowStart.fill(0); rowEnd.fill(0);
   const thr = P.lthr;
   for (let y = yT; y <= yB; y++) {
-    // expected paint width (≈15 cm) in pixels at this row, from the ground model
-    const pxPerM = Math.max(0.5, (y - cal.vpy) / cal.camH);
-    const k = Math.max(2, Math.min(14, Math.round(0.15 * pxPerM * 1.3 + 1)));
+    const pxPerM = Math.max(0.3, (y - cal.vpy) / cal.camH);
+    const k = Math.max(2, Math.min(18, Math.round(0.15 * pxPerM * 1.3 + 1)));
     const row = y * LW;
     let rowMean = 0; for (let x = 0; x < LW; x += 4) rowMean += G[row + x]; rowMean /= LW / 4;
+    rowStart[y] = feats.length;
+    const thrY = thr * Math.min(1, Math.max(0.5, 0.45 + pxPerM / 40));   // far paint is blurrier: accept weaker ridges
     for (let x = k; x < LW - k; x++) {
       const c = G[row + x], l = G[row + x - k], r = G[row + x + k];
       const v = 2 * c - l - r - Math.abs(l - r);
-      if (v > thr && c > rowMean + 12 && c > 80) feats.push(x, y, Math.min(v, 200));
+      if (v > thrY && c > rowMean + 8 && c > 70) feats.push(x, y, Math.min(v, 200));
     }
+    rowEnd[y] = feats.length;
   }
-  // --- Hough for the two ego lines (independent of calibration) ---
-  accL.fill(0); accR.fill(0);
+  // --- Hough on the NEAR part only (straight there even on curves) ---
+  const yN = Math.round(cal.vpy + (yB - cal.vpy) * 0.3);
+  accL.fill(0); accR.fill(0); accL2.fill(0); accR2.fill(0);
+  const iNear = rowStart[Math.max(yT, yN)];
   for (let i = 0; i < feats.length; i += 3) {
-    const x = feats[i], dy = yB - feats[i + 1], w = feats[i + 2];
+    const x = feats[i], dy = yB - feats[i + 1], w = feats[i + 2], near = i >= iNear;
     for (let p = 0; p < PHIS.length; p++) {
       const o = dy * PHIS[p];
       const bl = Math.round((x - o - XMIN) / BIN), br = Math.round((x + o - XMIN) / BIN);
-      if (bl >= 0 && bl < NB) accL[p * NB + bl] += w;
-      if (br >= 0 && br < NB) accR[p * NB + br] += w;
+      if (bl >= 0 && bl < NB) { accL2[p * NB + bl] += w; if (near) accL[p * NB + bl] += w; }
+      if (br >= 0 && br < NB) { accR2[p * NB + br] += w; if (near) accR[p * NB + br] += w; }
     }
   }
-  const rows = Math.max(1, yB - yT);
+  voteVanishingPoint(yB, Math.max(1, yB - yT));
+  const rows = Math.max(1, yB - Math.max(yT, yN));
   const cx = cal.vpx;
   const peak = (acc, lo, hi, sign) => {
     let best = 0, bp = -1, bb = -1;
@@ -256,18 +279,62 @@ function detectLanes(src){
       if (v > best) { best = v; bp = p; bb = b; }
     }
     const score = best / rows / 160;
-    if (bp < 0 || score < 0.3) return null;
+    if (bp < 0 || score < 0.25) return null;
     return { xb: bb * BIN + XMIN, t: sign * PHIS[bp], score };
   };
-  let detL = peak(accL, -LW * 0.7, cx, 1);
-  let detR = peak(accR, cx, LW * 1.7, -1);
+  let detL = peak(accL, -LW * 0.8, cx, 1);
+  let detR = peak(accR, cx, LW * 1.8, -1);
+  // a lane is at least ~2.4 m wide: if the pair is too narrow, the weaker one is something else (seam, shadow, overlay)
+  const dyB0 = Math.max(4, yB - cal.vpy), minW = 2.4 * dyB0 / 3.2;   // phones sit 0.7–3.2 m high (car … truck cab)
+  if (detL && detR && detR.xb - detL.xb < minW) {
+    if (detL.score < detR.score) detL = peak(accL, -LW * 0.8, Math.min(cx, detR.xb - minW), 1);
+    else detR = peak(accR, Math.max(cx, detL.xb + minW), LW * 1.8, -1);
+  }
   if (detL && detR) {
     const xTopL = detL.xb + detL.t * rows, xTopR = detR.xb + detR.t * rows;
     if (xTopL > xTopR + LW * 0.04) { if (detL.score < detR.score) detL = null; else detR = null; }
   }
   track(lane.L, detL); track(lane.R, detR);
   calibrate(yB);
-  multiLane(yB);
+  traceCurve(lane.L, yB); traceCurve(lane.R, yB);
+  // both traces must not collapse onto the same paint line
+  if (lane.L.curve && lane.R.curve && lane.R.curve.a - lane.L.curve.a < 1.5) {
+    const sL = lane.L.pts.length, sR = lane.R.pts.length;
+    if (sL < sR) lane.L.curve = null; else lane.R.curve = null;
+  }
+  // shared road shape (both edges of a lane bend together)
+  const cs = [lane.L.curve, lane.R.curve].filter(Boolean);
+  if (cs.length) {
+    const wsum = cs.reduce((s, c) => s + c.zMax, 0);
+    lane.b = cs.reduce((s, c) => s + c.b * c.zMax, 0) / wsum; lane.c = cs.reduce((s, c) => s + c.c * c.zMax, 0) / wsum;
+    lane.b = Math.max(-0.05, Math.min(0.05, lane.b));   // lines pass through the vanishing point: little heading left
+  } else { lane.b *= 0.9; lane.c *= 0.9; }
+  lane.zNear = fpx() * cal.camH / Math.max(1, yB - cal.vpy);
+  multiLane();
+  frameCount++;
+}
+// rows that never change while driving are the hood / dashboard
+function autoHood(y0){
+  if (prevG) {
+    for (let y = y0; y < LH; y++) {
+      let s = 0; const row = y * LW;
+      for (let x = 2; x < LW; x += 5) s += Math.abs(G[row + x] - prevG[row + x]);
+      rowMot[y] = rowMot[y] * 0.92 + (s / (LW / 5)) * 0.08;
+    }
+  }
+  if (!prevG) prevG = new Float32Array(LW * LH);
+  prevG.set(G.subarray(y0 * LW), y0 * LW);
+  if (frameCount % 10 || !P.auto) return;
+  const a = Math.round(cal.vpy + (LH - cal.vpy) * 0.25), b = Math.round(cal.vpy + (LH - cal.vpy) * 0.6);
+  if (b - a < 5) return;
+  const ref = Array.from(rowMot.subarray(a, b)).sort((p, q) => p - q)[((b - a) / 2) | 0];
+  if (ref < 2) return;                                   // car not moving: keep the previous estimate
+  let hood = LH;
+  for (let y = LH - 1; y > b; y--) {
+    let ok = true; for (let k = 0; k < 4; k++) if (rowMot[y - k] < ref * 0.4) { ok = false; break; }
+    if (ok) { hood = y + 1; break; }
+  }
+  cal.hoodY = cal.hoodY === null ? hood : cal.hoodY + (hood - cal.hoodY) * 0.3;
 }
 function track(s, det){
   const close = (a, b) => Math.abs(a.xb - b.xb) < LW * 0.1 && Math.abs(Math.atan(a.t) - Math.atan(b.t)) < 0.18;
@@ -281,72 +348,177 @@ function track(s, det){
     } else if (++s.jump >= 4) { s.line = { xb: det.xb, t: det.t }; s.jump = 0; s.lost = 0; }
     else s.lost++;
   } else s.lost++;
-  if (s.lost > 12) { s.line = null; s.cand = null; }
+  if (s.lost > 12) { s.line = null; s.cand = null; s.curve = null; }
+}
+// every visible lane line (any lane, dashed or solid) points at the same vanishing point:
+// intersect the strongest lines pairwise and take a weighted median
+function voteVanishingPoint(yB, rows){
+  if (!P.auto) return;
+  const peaksN = (acc, sign, n) => {
+    const out = [], A = acc.slice();
+    for (let k = 0; k < n; k++) {
+      let best = 0, bp = -1, bb = -1;
+      for (let p = 0; p < PHIS.length; p++) for (let b = 1; b < NB - 1; b++) { const v = A[p * NB + b]; if (v > best) { best = v; bp = p; bb = b; } }
+      const score = best / rows / 160;
+      if (bp < 0 || score < 0.08) break;
+      out.push({ xb: bb * BIN + XMIN, t: sign * PHIS[bp], score });
+      for (let p = Math.max(0, bp - 3); p <= Math.min(PHIS.length - 1, bp + 3); p++) for (let b = Math.max(0, bb - 6); b <= Math.min(NB - 1, bb + 6); b++) A[p * NB + b] = 0;
+    }
+    return out;
+  };
+  // a real lane line has paint spread along its length, not just one blob it pivots around
+  const spread = l => {
+    const yT0 = Math.max(roi.yT, 0), bands = 6; let hit = 0;
+    for (let k = 0; k < bands; k++) {
+      const ya = Math.round(yT0 + (yB - yT0) * k / bands), yb2 = Math.round(yT0 + (yB - yT0) * (k + 1) / bands);
+      let found = false;
+      for (let y = ya; y < yb2 && !found; y++) {
+        const xl = l.xb + l.t * (yB - y);
+        for (let i = rowStart[y]; i < rowEnd[y]; i += 3) if (Math.abs(feats[i] - xl) < 2.5) { found = true; break; }
+      }
+      if (found) hit++;
+    }
+    return hit;
+  };
+  const lines = peaksN(accL2, 1, 6).concat(peaksN(accR2, -1, 6)).filter(l => spread(l) >= 3);
+  const vs = [];
+  for (let i = 0; i < lines.length; i++) for (let j = i + 1; j < lines.length; j++) {
+    const l = lines[i], r = lines[j], dd = l.t - r.t;
+    if (Math.abs(dd) < 0.25) continue;
+    const d = (r.xb - l.xb) / dd, vy = yB - d, vx = l.xb + l.t * d;
+    if (vy < LH * 0.12 || vy > LH * 0.75 || vx < -LW * 0.1 || vx > LW * 1.1 || d < yB * 0.3) continue;
+    vs.push({ vx, vy, w: l.score * r.score });
+  }
+  if (!vs.length) return;
+  const wmed = key => { const a = vs.slice().sort((p, q) => p[key] - q[key]); const tot = a.reduce((s, v) => s + v.w, 0); let acc = 0; for (const v of a) { acc += v.w; if (acc >= tot / 2) return v[key]; } return a[a.length - 1][key]; };
+  const vy = wmed('vy'), vx = wmed('vx');
+  const support = vs.filter(v => Math.abs(v.vy - vy) < LH * 0.03 && Math.abs(v.vx - vx) < LW * 0.05).length;
+  if (support < 1) return;
+  const a = cal.n < 40 ? 0.15 : 0.03;
+  cal.vpy += (vy - cal.vpy) * a; cal.vpx += (vx - cal.vpx) * a;
+  cal.n++; cal.conf = Math.min(1, cal.n / 60);
 }
 function calibrate(yB){
+  // camera height from the ego lane width (when both ego lines are visible)
   const L = lane.L.line, R = lane.R.line;
-  if (!L || !R || !P.auto) return;
-  const dd = L.t - R.t; if (dd < 0.05) return;
-  const d = (R.xb - L.xb) / dd;                 // distance above yB where the lines meet
-  const vy = yB - d, vx = L.xb + L.t * d;
-  if (vy < LH * 0.15 || vy > LH * 0.85 || vx < -LW * 0.2 || vx > LW * 1.2) return;
-  const a = cal.n < 60 ? 0.12 : 0.02;          // fast at first, then slow and steady
-  cal.vpy += (vy - cal.vpy) * a; cal.vpx += (vx - cal.vpx) * a;
-  // camera height from the known lane width
+  if (!L || !R || !P.auto || cal.n < 10) return;
   const wPx = R.xb - L.xb, dyB = yB - cal.vpy;
   if (dyB > 5 && wPx > 10) {
     const h = LANE_W() * dyB / wPx;
-    if (h > 0.4 && h < 3) cal.camH += (h - cal.camH) * (cal.n < 60 ? 0.1 : 0.015);
+    if (h > 0.6 && h < 3.4) cal.camH += (h - cal.camH) * (cal.hN++ < 60 ? 0.1 : 0.015);
+    cal.camH = Math.max(0.6, Math.min(3.4, cal.camH));
   }
-  cal.n++; cal.conf = Math.min(1, cal.n / 90);
 }
-function multiLane(yB){
-  // project every paint pixel onto the road plane (lateral X, metres) and build a histogram
-  hist.forEach((v, i) => hist[i] = v * 0.88);
+// follow one line from the bottom up to the horizon, tolerant of dash gaps and curves
+function traceCurve(s, yB){
+  if (!s.line) { s.pts = []; return; }
+  const pts = [];
+  let x = s.line.xb, slope = s.line.t;              // slope = dx per row going UP
+  let lastY = yB, lastX = x, lastZ = null;
+  const f = fpx();
+  for (let y = yB; y > cal.vpy + 2; y--) {
+    const dyv = y - cal.vpy;
+    const Z = f * cal.camH / dyv;
+    if (Z > 120) break;
+    const xp = lastX + slope * (lastY - y);
+    const win = Math.max(2.5, 0.4 * dyv / cal.camH);   // ±0.4 m around the prediction
+    let sw = 0, sx = 0;
+    for (let i = rowStart[y]; i < rowEnd[y]; i += 3) { const fx = feats[i]; if (fx > xp - win && fx < xp + win) { sw += feats[i + 2]; sx += fx * feats[i + 2]; } }
+    if (sw > 0) {
+      const xm = sx / sw;
+      if (lastY - y > 0 && pts.length > 3) slope = slope * 0.8 + ((xm - lastX) / (lastY - y)) * 0.2;
+      lastX = xm; lastY = y; lastZ = Z; pts.push([xm, y, Math.min(sw, 400)]);
+    } else if (lastZ !== null && Z - lastZ > 16 && lastY - y > 6) break;  // longer than a dash gap: line ended
+    else if (lastZ === null && yB - y > 40) break;
+    if (lastX < -LW * 0.3 || lastX > LW * 1.3) break;
+  }
+  s.pts = pts;
+  // weighted least squares in ground coordinates: X = a + bZ + cZ²
+  if (pts.length < 6) return;
+  let S = [0, 0, 0, 0, 0], T = [0, 0, 0], zMax = 0;
+  for (const [px, py, w] of pts) {
+    const g = imageToGround(px, py); if (!g) continue;
+    const z = g.Z; zMax = Math.max(zMax, z);
+    S[0] += w; S[1] += w * z; S[2] += w * z * z; S[3] += w * z * z * z; S[4] += w * z * z * z * z;
+    T[0] += w * g.X; T[1] += w * g.X * z; T[2] += w * g.X * z * z;
+  }
+  let a, b, c = 0;
+  const lam = 2e4 * S[0] / Math.max(1, zMax * zMax);      // keeps curvature modest unless well supported
+  if (zMax > 18 && pts.length > 15) {
+    const M = [[S[0], S[1], S[2]], [S[1], S[2], S[3]], [S[2], S[3], S[4] + lam]];
+    const sol = solve3(M, T); if (!sol) return; [a, b, c] = sol;
+  } else {
+    const det = S[0] * S[2] - S[1] * S[1]; if (Math.abs(det) < 1e-9) return;
+    a = (T[0] * S[2] - S[1] * T[1]) / det; b = (S[0] * T[1] - S[1] * T[0]) / det;
+  }
+  c = Math.max(-0.006, Math.min(0.006, c)); b = Math.max(-0.6, Math.min(0.6, b));
+  const prev = s.curve, k = prev ? 0.35 : 1;
+  s.curve = prev ? { a: prev.a + (a - prev.a) * k, b: prev.b + (b - prev.b) * k, c: prev.c + (c - prev.c) * k, zMax: prev.zMax + (Math.min(100, zMax) - prev.zMax) * 0.3 }
+                 : { a, b, c, zMax: Math.min(100, zMax) };
+}
+function solve3(M, v){
+  const [[a, b, c], [d, e, f], [g, h, i]] = M;
+  const D = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  if (Math.abs(D) < 1e-12) return null;
+  const Dx = v[0] * (e * i - f * h) - b * (v[1] * i - f * v[2]) + c * (v[1] * h - e * v[2]);
+  const Dy = a * (v[1] * i - f * v[2]) - v[0] * (d * i - f * g) + c * (d * v[2] - v[1] * g);
+  const Dz = a * (e * v[2] - v[1] * h) - b * (d * v[2] - v[1] * g) + v[0] * (d * h - e * g);
+  return [Dx / D, Dy / D, Dz / D];
+}
+const roadShift = Z => lane.b * Z + lane.c * Z * Z;   // how far the road has bent at distance Z
+function multiLane(){
+  // project paint onto the road, "straighten" it with the ego curve, histogram lateral offsets
+  hist.forEach((v, i) => hist[i] = v * 0.9);
   const f = fpx(), h = cal.camH;
+  // one vote per marking per row, so a wide solid line can't drown out thin dashed ones
+  let lastRow = -1, seen = new Set();
   for (let i = 0; i < feats.length; i += 3) {
-    const dy = feats[i + 1] - cal.vpy; if (dy < 2) continue;
-    const Z = f * h / dy; if (Z > 28) continue;
-    const X = (feats[i] - cal.vpx) * h / dy;
-    const b = Math.round((X - HX0) / HB); if (b >= 0 && b < HN) hist[b] += feats[i + 2];
+    const y = feats[i + 1];
+    if (y !== lastRow) { seen = new Set(); lastRow = y; }
+    const dy = y - cal.vpy; if (dy < 1.5) continue;
+    const Z = f * h / dy; if (Z > 80) continue;
+    const X = (feats[i] - cal.vpx) * h / dy - roadShift(Z);
+    const bb = Math.round((X - HX0) / HB); if (bb < 1 || bb >= HN - 1 || seen.has(bb)) continue;
+    seen.add(bb); seen.add(bb - 1); seen.add(bb + 1);
+    hist[bb] += 1; hist[bb - 1] += 0.5; hist[bb + 1] += 0.5;
   }
   let mx = 0; for (let i = 0; i < HN; i++) if (hist[i] > mx) mx = hist[i];
   const marks = [];
-  if (mx > 1500) {
+  if (mx > 25) {
     for (let i = 2; i < HN - 2; i++) {
-      const v = hist[i] + 0.6 * (hist[i - 1] + hist[i + 1]);
-      if (v < mx * 0.22) continue;
+      if (hist[i] < Math.max(6, mx * 0.06)) continue;
       let isMax = true; for (let j = -6; j <= 6; j++) if (j && i + j >= 0 && i + j < HN && hist[i + j] > hist[i]) { isMax = false; break; }
       if (isMax) marks.push(HX0 + i * HB);
     }
   }
-  // ego boundaries from the Hough lines (more reliable), converted to metres
-  const toX = ln => ln ? (ln.xb - cal.vpx) * h / Math.max(1, yB - cal.vpy) : null;
-  const xl = toX(lane.L.line), xr = toX(lane.R.line), lw = LANE_W();
-  let egoL = xl, egoR = xr;
-  if (egoL === null && egoR !== null) egoL = egoR - lw;
-  if (egoR === null && egoL !== null) egoR = egoL + lw;
+  const lw = LANE_W();
+  let egoL = lane.L.curve ? lane.L.curve.a : null, egoR = lane.R.curve ? lane.R.curve.a : null;
+  if (egoL === null && lane.L.line) egoL = (lane.L.line.xb - cal.vpx) * h / Math.max(1, roi.yB - cal.vpy);
+  if (egoR === null && lane.R.line) egoR = (lane.R.line.xb - cal.vpx) * h / Math.max(1, roi.yB - cal.vpy);
+  if (egoL === null && egoR !== null) egoL = egoR - (lane.width || lw);
+  if (egoR === null && egoL !== null) egoR = egoL + (lane.width || lw);
   lane.egoL = egoL; lane.egoR = egoR;
-  // chain markings outward from the ego lane at lane-width spacing
   let nl = 0, nr = 0;
   if (egoL !== null) {
     const sorted = marks.slice().sort((a, b) => a - b);
     let cur = egoL;
-    while (true) { const nx = sorted.filter(m => m < cur - lw * 0.7 && m > cur - lw * 1.35).pop(); if (nx === undefined) break; nl++; cur = nx; if (nl > 4) break; }
+    while (nl < 5) { const nx = sorted.filter(m => m < cur - lw * 0.7 && m > cur - lw * 1.4).pop(); if (nx === undefined) break; nl++; cur = nx; }
     cur = egoR;
-    while (true) { const nx = sorted.find(m => m > cur + lw * 0.7 && m < cur + lw * 1.35); if (nx === undefined) break; nr++; cur = nx; if (nr > 4) break; }
+    while (nr < 5) { const nx = sorted.find(m => m > cur + lw * 0.7 && m < cur + lw * 1.4); if (nx === undefined) break; nr++; cur = nx; }
   }
   lane.marks = marks;
-  // smooth the lane count over time (majority of last ~1.5 s)
-  if (egoL !== null) { lane.laneHist.push(nl * 10 + nr); if (lane.laneHist.length > 45) lane.laneHist.shift(); }
+  if (P.auto && cal.conf > 0.5 && marks.length >= 2) {
+    const sp = []; const sm = marks.slice().sort((a, b) => a - b);
+    for (let i = 1; i < sm.length; i++) { const d = sm[i] - sm[i - 1]; if (d > lw * 0.55 && d < lw * 1.6) sp.push(d); }
+    if (sp.length) { sp.sort((a, b) => a - b); const med = sp[sp.length >> 1]; const hEst = cal.camH * lw / med; if (hEst > 0.6 && hEst < 3.4) cal.camH += (hEst - cal.camH) * 0.02; cal.camH = Math.max(0.6, Math.min(3.4, cal.camH)); }
+  }
+  if (egoL !== null) { lane.laneHist.push(nl * 10 + nr); if (lane.laneHist.length > 60) lane.laneHist.shift(); }
+  else if (lane.laneHist.length) lane.laneHist.shift();
   if (lane.laneHist.length > 10) {
     const cnt = {}; let best = null, bc = 0;
     for (const v of lane.laneHist) { cnt[v] = (cnt[v] || 0) + 1; if (cnt[v] > bc) { bc = cnt[v]; best = v; } }
-    const l = Math.floor(best / 10), r = best % 10;
-    lane.nLeft = l; lane.nRight = r; lane.nLanes = 1 + l + r; lane.egoIdx = l + 1;
-  }
-  if (egoL === null && lane.laneHist.length) lane.laneHist.shift();
-  if (!lane.laneHist.length) { lane.nLanes = null; lane.egoIdx = null; }
+    lane.nLeft = Math.floor(best / 10); lane.nRight = best % 10; lane.nLanes = 1 + lane.nLeft + lane.nRight; lane.egoIdx = lane.nLeft + 1;
+  } else if (!lane.laneHist.length) { lane.nLanes = null; lane.egoIdx = null; }
 }
 function laneLogic(){
   const L = lane.L.line, R = lane.R.line;
@@ -357,7 +529,8 @@ function laneLogic(){
     if (w > 1.5 && w < 7) { lane.width = lane.width ? lane.width * 0.95 + w * 0.05 : w; off = (carX - (lane.egoL + lane.egoR) / 2) / w; }
   }
   lane.offset = off;
-  if (off !== null && Math.abs(off) > P.dep) lane.depFrames++; else lane.depFrames = Math.max(0, lane.depFrames - 2);
+  const trusted = (lane.L.line && lane.R.line) || cal.conf >= 0.9;
+  if (off !== null && trusted && Math.abs(off) > P.dep) lane.depFrames++; else lane.depFrames = Math.max(0, lane.depFrames - 2);
   if (lane.depFrames >= 6) {
     const side = off < 0 ? 'L' : 'R';
     const busy = vtracks.some(t => t.ok && t.lane === (side === 'L' ? -1 : 1) && t.Z < 14);
@@ -365,7 +538,8 @@ function laneLogic(){
     else if (side === 'L') alertUser('lane-left', '⚠️ Chap chiziqqa yaqinlashdingiz', 'bad', 3500, 'Chap chiziq');
     else alertUser('lane-right', "⚠️ O'ng chiziqqa yaqinlashdingiz", 'bad', 3500, "O'ng chiziq");
   }
-  $('sOff').textContent = off === null ? '—' : (Math.abs(off) > P.dep ? (off < 0 ? '← chapda' : "o'ngda →") : 'markazda ✓');
+  const curv = Math.abs(lane.c) > 0.0006 ? (lane.c > 0 ? ' · ↪' : ' · ↩') : '';
+  $('sOff').textContent = off === null ? '—' : (Math.abs(off) > P.dep ? (off < 0 ? '← chapda' : "o'ngda →") : 'markazda ✓') + curv;
   $('sLanes').textContent = lane.nLanes ? `${lane.nLanes} ta · siz ${lane.egoIdx}-da` : (L || R ? 'aniqlanmoqda…' : '—');
   $('sCal').textContent = P.auto ? (cal.conf >= 1 ? `✓ h=${cal.camH.toFixed(2)} m` : `${Math.round(cal.conf * 100)}%`) : "qo'lda";
 }
@@ -393,7 +567,7 @@ function runDetector(src){
   // leave time for lane/sign processing on slower phones
   if (t0 - lastDetStart < Math.max(90, detMs * 1.6)) return;
   lastDetStart = t0; detBusy = true;
-  model.detect(src, 20, 0.38).then(r => {
+  model.detect(src, 20, 0.45).then(r => {
     detMs = detMs ? detMs * 0.8 + (performance.now() - t0) * 0.2 : performance.now() - t0; detBusy = false; detCount++;
     onDetections(r.map(o => ({ cls: o.class, x: o.bbox[0], y: o.bbox[1], w: o.bbox[2], h: o.bbox[3], score: o.score })), performance.now(), src);
   }).catch(() => { detBusy = false; });
@@ -419,14 +593,15 @@ function iou(a, b){
   const x0 = Math.max(a.x, b.x), y0 = Math.max(a.y, b.y), x1 = Math.min(a.x + a.w, b.x + b.w), y1 = Math.min(a.y + a.h, b.y + b.h);
   const i = Math.max(0, x1 - x0) * Math.max(0, y1 - y0); return i / (a.w * a.h + b.w * b.h - i + 1e-6);
 }
-function laneOfX(X){
+function laneOfX(X, Z){
+  X -= roadShift(Z || 0);
   const lw = lane.width || LANE_W();
   const L = lane.egoL !== null ? lane.egoL : -lw / 2, R = lane.egoR !== null ? lane.egoR : lw / 2;
   if (X >= L - 0.15 && X <= R + 0.15) return 0;
   return X < L ? -Math.ceil((L - X) / lw) : Math.ceil((X - R) / lw);
 }
 function onDetections(dets, now, src){
-  const veh = dets.filter(d => VEH[d.cls] && d.w > 6 && d.h > 6);
+  const veh = dets.filter(d => VEH[d.cls] && d.w > 6 && d.h > 6 && (cal.conf < 0.5 || (d.y + d.h) * LH / srcH > cal.vpy + 1));
   // traffic lights and stop signs feed the other subsystems
   lights = dets.filter(d => d.cls === 'traffic light' && d.h > 10).map(d => ({ ...d, state: lightState(src, d) }));
   for (const d of dets) if (d.cls === 'stop sign') signCandsExtra.push({ kind: 'stop', cx: (d.x + d.w / 2) / srcW, cy: (d.y + d.h / 2) / srcH, w: d.w / srcW, h: d.h / srcH });
@@ -456,7 +631,7 @@ function onDetections(dets, now, src){
     const g = geom(d);
     vtracks.push({ id: vid++, cls: d.cls, box: { x: d.x, y: d.y, w: d.w, h: d.h }, Z: g ? g.Z : null, X: g ? g.X : null, vz: null, t: now, hits: 1, miss: 0 });
   });
-  for (const t of vtracks) { t.ok = t.hits >= 2 && t.Z !== null; t.lane = t.X !== null ? laneOfX(t.X) : null; }
+  for (const t of vtracks) { t.ok = t.hits >= 2 && t.Z !== null; t.lane = t.X !== null ? laneOfX(t.X, t.Z) : null; }
   vehicleLogic();
 }
 function lightState(src, d){
@@ -766,7 +941,7 @@ const demo = (() => {
   const KINDS_EU = [['speed', 60], ['stop'], ['warn'], ['speed', 90], ['yield'], ['noentry'], ['speed', 40], ['speed', 110]];
   const lw = () => LANE_W();
   function proj(X, Z, Y){ return [W / 2 + f * X / Z, yh + f * (camH - (Y || 0)) / Z]; }
-  function curve(Z){ return 0.0006 * Math.sin(t * 0.12) * Z * Z; }
+  function curve(Z){ return 0.0022 * Math.sin(t * 0.12) * Z * Z; }
   function reset(){
     t = 0; travel = 0; carX = 0; signs = []; nextSign = 1.2; seq = 0;
     cars = [ { lane: 0, Z: 32, vrel: 0, kind: 'car', col: '#2b4c7e', brake: 0 }, { lane: -1, Z: 14, vrel: 1.5, kind: 'car', col: '#7a2b2b' },
@@ -903,32 +1078,47 @@ function render(src){
     ctx.beginPath(); ctx.moveTo(0, cal.vpy * ky); ctx.lineTo(W, cal.vpy * ky); ctx.stroke(); ctx.setLineDash([]);
     ctx.beginPath(); ctx.arc(cal.vpx * kx, cal.vpy * ky, 6, 0, Math.PI * 2); ctx.stroke();
   }
-  // lane markings from the multi-lane model (thin), ego lane (filled)
-  const lineAt = (X, Z) => groundToImage(X, Z);
+  // curves are drawn on the road plane: X(Z) = a + bZ + cZ², projected into the image
+  const zNear = lane.zNear;
+  const curvePts = (X0, zMax) => {
+    const out = [];
+    for (let Z = zNear; Z <= zMax; Z *= 1.06) { const X = X0 + roadShift(Z); const [x, y] = groundToImage(X, Z); out.push([x * kx, Math.min(yB, y) * ky]); }
+    return out;
+  };
+  const sideCurve = s => {
+    if (s.curve) {
+      const c = s.curve, out = [];
+      for (let Z = zNear; Z <= c.zMax; Z *= 1.06) { const [x, y] = groundToImage(c.a + c.b * Z + c.c * Z * Z, Z); out.push([x * kx, Math.min(yB, y) * ky]); }
+      return out;
+    }
+    if (s.line) { const ln = s.line, yTop = yT + (yB - yT) * 0.5; return [[(ln.xb) * kx, yB * ky], [(ln.xb + ln.t * (yB - yTop)) * kx, yTop * ky]]; }
+    return null;
+  };
+  const stroke = pts => { ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke(); };
+  // other lanes (thin dashed)
   if (lane.egoL !== null && cal.conf > 0.3) {
-    ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,255,255,.45)'; ctx.setLineDash([10, 10]);
+    ctx.lineWidth = Math.max(2, W / 400); ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.setLineDash([12, 10]);
+    const zFar = Math.max(30, Math.min(80, Math.max(lane.L.curve ? lane.L.curve.zMax : 0, lane.R.curve ? lane.R.curve.zMax : 0)));
     for (const m of lane.marks) {
-      if (Math.abs(m - lane.egoL) < 0.6 || Math.abs(m - lane.egoR) < 0.6) continue;
-      const a = lineAt(m, 4), b = lineAt(m, 30);
-      ctx.beginPath(); ctx.moveTo(a[0] * kx, Math.min(yB, a[1]) * ky); ctx.lineTo(b[0] * kx, b[1] * ky); ctx.stroke();
+      if (Math.abs(m - lane.egoL) < 0.8 || Math.abs(m - lane.egoR) < 0.8) continue;
+      const pts = curvePts(m, zFar); if (pts.length > 1) stroke(pts);
     }
     ctx.setLineDash([]);
   }
-  const L = lane.L.line, R = lane.R.line, rows = yB - yT;
-  const xAt = (ln, y) => (ln.xb + ln.t * (yB - y)) * kx;
   const warn = lane.depFrames >= 6;
-  const yTop = yT + rows * 0.15;
-  if (L && R) {
-    const g = ctx.createLinearGradient(0, yB * ky, 0, yTop * ky);
-    g.addColorStop(0, warn ? 'rgba(255,77,77,.35)' : 'rgba(61,170,255,.32)'); g.addColorStop(1, 'rgba(61,170,255,0)');
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.moveTo(xAt(L, yB), yB * ky); ctx.lineTo(xAt(L, yTop), yTop * ky); ctx.lineTo(xAt(R, yTop), yTop * ky); ctx.lineTo(xAt(R, yB), yB * ky); ctx.fill();
+  const cl = sideCurve(lane.L), cr = sideCurve(lane.R);
+  if (cl && cr && cl.length > 1 && cr.length > 1) {
+    const n = Math.min(cl.length, cr.length);
+    const g = ctx.createLinearGradient(0, cl[0][1], 0, Math.min(cl[n - 1][1], cr[n - 1][1]));
+    g.addColorStop(0, warn ? 'rgba(255,77,77,.38)' : 'rgba(61,170,255,.34)'); g.addColorStop(1, 'rgba(61,170,255,0.03)');
+    ctx.fillStyle = g; ctx.beginPath();
+    for (let i = 0; i < n; i++) ctx[i ? 'lineTo' : 'moveTo'](cl[i][0], cl[i][1]);
+    for (let i = n - 1; i >= 0; i--) ctx.lineTo(cr[i][0], cr[i][1]);
+    ctx.fill();
   }
-  ctx.lineWidth = Math.max(4, W / 170); ctx.lineCap = 'round';
-  for (const ln of [L, R]) if (ln) {
-    ctx.strokeStyle = warn ? '#ff4d4d' : '#3ddc97';
-    ctx.beginPath(); ctx.moveTo(xAt(ln, yB), yB * ky); ctx.lineTo(xAt(ln, yTop), yTop * ky); ctx.stroke();
-  }
+  ctx.lineWidth = Math.max(4, W / 170); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const pts of [cl, cr]) if (pts && pts.length > 1) { ctx.strokeStyle = warn ? '#ff4d4d' : '#3ddc97'; stroke(pts); }
+  if (P.dbg && cal.hoodY !== null) { ctx.strokeStyle = 'rgba(255,120,0,.9)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, yB * ky); ctx.lineTo(W, yB * ky); ctx.stroke(); }
   // vehicles
   const sx = W / srcW, sy = H / srcH;
   ctx.font = `600 ${Math.max(11, W / 75)}px system-ui`;
@@ -982,16 +1172,24 @@ function renderBev(){
   const W = bev.width, H = bev.height, g = bctx;
   g.fillStyle = '#0f1318'; g.fillRect(0, 0, W, H);
   // lateral scale is fixed; distance is compressed so far cars still fit (like a car's dashboard view)
-  const Zmax = 80, K = 18, egoY = H * 0.84, top = H * 0.07, pxm = W / 13;
-  const zy = Z => egoY - (egoY - top) * (Z / (Z + K)) / (Zmax / (Zmax + K));
-  const toS = (X, Z) => [W / 2 + X * pxm, zy(Z)];
+  const Zmax = 80, K = 18, egoY = H * 0.84, top = H * 0.07;
   const lw = lane.width || LANE_W();
   const egoL = lane.egoL !== null ? lane.egoL : -lw / 2, egoR = lane.egoR !== null ? lane.egoR : lw / 2;
   const nl = lane.nLanes ? lane.nLeft : 1, nr = lane.nLanes ? lane.nRight : 1;
   const left = egoL - nl * lw, right = egoR + nr * lw;
-  // road surface
-  const gr = g.createLinearGradient(0, egoY, 0, 0); gr.addColorStop(0, '#2a3038'); gr.addColorStop(1, 'rgba(42,48,56,0)');
-  g.fillStyle = gr; const [a0] = toS(left, 0), [a1] = toS(right, 0); g.fillRect(a0, 0, a1 - a0, H);
+  // fit the whole road across the panel; keep the ego car on screen
+  const pxm = Math.min(W / 11, W / (right - left + 2.5));
+  const half = W / 2 / pxm;
+  const cxM = Math.max(left - 1 + half, Math.min(right + 1 - half, (left + right) / 2));
+  const zy = Z => egoY - (egoY - top) * (Z / (Z + K)) / (Zmax / (Zmax + K));
+  const toS = (X, Z) => [W / 2 + (X - cxM) * pxm, zy(Z)];
+  const ZS = []; for (let Z = -4; Z <= Zmax; Z += 2) ZS.push(Z);
+  const curve = X => ZS.map(Z => toS(X + roadShift(Math.max(0, Z)), Z));
+  // road surface (follows the curve)
+  const gr = g.createLinearGradient(0, egoY, 0, 0); gr.addColorStop(0, '#2a3038'); gr.addColorStop(1, 'rgba(42,48,56,0.15)');
+  g.fillStyle = gr; g.beginPath();
+  curve(left - 0.6).forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](p[0], p[1]));
+  curve(right + 0.6).reverse().forEach(p => g.lineTo(p[0], p[1])); g.fill();
   // lane lines
   const bounds = []; for (let i = 0; i <= nl; i++) bounds.push(egoL - i * lw); for (let i = 0; i <= nr; i++) bounds.push(egoR + i * lw);
   for (const X of bounds) {
@@ -999,8 +1197,7 @@ function renderBev(){
     const ego = Math.abs(X - egoL) < 0.01 || Math.abs(X - egoR) < 0.01;
     g.strokeStyle = ego ? (lane.depFrames >= 6 ? '#ff4d4d' : '#3ddc97') : edge ? 'rgba(255,255,255,.75)' : 'rgba(255,255,255,.5)';
     g.lineWidth = ego ? 3 : 2; g.setLineDash(edge || ego ? [] : [14, 14]);
-    const [x0, y0] = toS(X, -3), [x1, y1] = toS(X, Zmax);
-    g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+    g.beginPath(); curve(X).forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](p[0], p[1])); g.stroke();
   }
   g.setLineDash([]);
   // distance rings
@@ -1034,7 +1231,7 @@ function renderBev(){
 // Main loop
 // ===================================================================
 function resetState(){
-  lane.L = mkSide(); lane.R = mkSide(); lane.width = null; lane.depFrames = 0; lane.laneHist = []; lane.nLanes = null; lane.marks = []; lane.egoL = lane.egoR = null;
+  lane.L = mkSide(); lane.R = mkSide(); lane.width = null; lane.depFrames = 0; lane.laneHist = []; lane.nLanes = null; lane.marks = []; lane.egoL = lane.egoR = null; lane.b = 0; lane.c = 0;
   hist.fill(0); signTracks = []; curLimit = null; updateLimitStat(); vtracks = []; lead = null; lights = [];
 }
 let lastT = 0, fpsAcc = 0, fpsN = 0, tick = 0;
